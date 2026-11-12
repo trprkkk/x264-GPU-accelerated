@@ -1,0 +1,27 @@
+yuv [info]: 1280x720p 0:0 @ 30/1 fps (cfr)
+x264 [warning]: --psnr used with psy on: results will be invalid!
+x264 [warning]: --tune psnr should be used if attempting to benchmark psnr!
+x264 [info]: using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2
+x264 [info]: CUDA ME: NVIDIA GeForce RTX 2060 SUPER (sm_75)
+x264 [info]: profile High, level 3.1, 4:2:0, 8-bit
+[0.4%] 1/240 frames, 3.29 fps, 6834.96 kb/s, eta 0:01:12  [4.2%] 10/240 frames, 17.45 fps, 1182.91 kb/s, eta 0:00:13  [7.9%] 19/240 frames, 23.06 fps, 847.65 kb/s, eta 0:00:09  [11.2%] 27/240 frames, 25.14 fps, 813.03 kb/s, eta 0:00:08  [15.0%] 36/240 frames, 26.93 fps, 772.43 kb/s, eta 0:00:07  [18.8%] 45/240 frames, 28.28 fps, 715.70 kb/s, eta 0:00:06  [22.9%] 55/240 frames, 29.71 fps, 670.91 kb/s, eta 0:00:06  [26.7%] 64/240 frames, 30.06 fps, 677.84 kb/s, eta 0:00:05  [30.8%] 74/240 frames, 30.55 fps, 663.82 kb/s, eta 0:00:05  [35.0%] 84/240 frames, 31.43 fps, 634.57 kb/s, eta 0:00:04  [39.2%] 94/240 frames, 31.85 fps, 640.31 kb/s, eta 0:00:04  [43.3%] 104/240 frames, 32.33 fps, 634.61 kb/s, eta 0:00:04  [47.5%] 114/240 frames, 32.80 fps, 622.20 kb/s, eta 0:00:03  [51.7%] 124/240 frames, 33.16 fps, 613.58 kb/s, eta 0:00:03  [56.2%] 135/240 frames, 33.65 fps, 594.81 kb/s, eta 0:00:03  [60.8%] 146/240 frames, 34.16 fps, 584.52 kb/s, eta 0:00:02  [64.6%] 155/240 frames, 34.10 fps, 586.31 kb/s, eta 0:00:02  [68.8%] 165/240 frames, 34.31 fps, 578.25 kb/s, eta 0:00:02  [72.9%] 175/240 frames, 34.52 fps, 571.97 kb/s, eta 0:00:01  [77.1%] 185/240 frames, 34.68 fps, 579.27 kb/s, eta 0:00:01  [80.8%] 194/240 frames, 34.73 fps, 598.52 kb/s, eta 0:00:01  [85.0%] 204/240 frames, 34.90 fps, 616.51 kb/s, eta 0:00:01  [90.4%] 217/240 frames, 35.54 fps, 615.98 kb/s, eta 0:00:00  [97.5%] 234/240 frames, 36.80 fps, 656.75 kb/s, eta 0:00:00                                                                                 x264 [info]: frame I:2     Avg QP:19.50  size: 46044  PSNR Mean Y:47.90 U:50.22 V:51.19 Avg:48.61 Global:48.21
+x264 [info]: frame P:72    Avg QP:22.56  size:  6131  PSNR Mean Y:44.68 U:48.82 V:50.59 Avg:45.71 Global:45.23
+x264 [info]: frame B:166   Avg QP:26.01  size:   688  PSNR Mean Y:45.01 U:48.73 V:50.55 Avg:45.99 Global:45.53
+x264 [info]: consecutive B-frames:  3.3%  8.3% 15.0% 73.3%
+x264 [info]: mb I  I16..4: 18.3% 66.4% 15.3%
+x264 [info]: mb P  I16..4:  2.2%  2.8%  0.9%  P16..4: 24.2%  3.8%  2.8%  0.0%  0.0%    skip:63.4%
+x264 [info]: mb B  I16..4:  0.1%  0.0%  0.0%  B16..8: 20.0%  0.1%  0.0%  direct: 0.1%  skip:79.7%  L0:50.9% L1:48.9% BI: 0.1%
+x264 [info]: 8x8 transform intra:53.2% inter:84.2%
+x264 [info]: coded y,uvDC,uvAC intra: 51.0% 56.6% 30.8% inter: 2.6% 3.9% 0.1%
+x264 [info]: i16 v,h,dc,p: 11% 74%  2% 13%
+x264 [info]: i8 v,h,dc,ddl,ddr,vr,hd,vl,hu: 20% 31% 14%  4%  6%  6%  7%  5%  7%
+x264 [info]: i4 v,h,dc,ddl,ddr,vr,hd,vl,hu: 40% 23%  7%  4%  6%  6%  5%  4%  4%
+x264 [info]: i8c dc,h,v,p: 47% 25% 20%  8%
+x264 [info]: Weighted P-Frames: Y:0.0% UV:0.0%
+x264 [info]: ref P L0: 80.5% 11.7%  5.6%  2.2%
+x264 [info]: ref B L0: 94.9%  4.7%  0.4%
+x264 [info]: ref B L1: 97.9%  2.1%
+x264 [info]: SSIM Mean Y:0.9908659 (20.393db)
+x264 [info]: PSNR Mean Y:44.938 U:48.770 V:50.567 Avg:45.931 Global:45.451 kb/s:647.63
+
+encoded 240 frames, 37.20 fps, 647.63 kb/s

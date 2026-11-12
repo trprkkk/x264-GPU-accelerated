@@ -1,0 +1,26 @@
+yuv [info]: 1280x720p 0:0 @ 30/1 fps (cfr)
+x264 [warning]: --psnr used with psy on: results will be invalid!
+x264 [warning]: --tune psnr should be used if attempting to benchmark psnr!
+x264 [info]: using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2
+x264 [info]: profile High, level 3.1, 4:2:0, 8-bit
+[0.4%] 1/240 frames, 2.92 fps, 6809.76 kb/s, eta 0:01:21  [2.5%] 6/240 frames, 10.12 fps, 1679.92 kb/s, eta 0:00:23  [5.0%] 12/240 frames, 13.70 fps, 1036.38 kb/s, eta 0:00:16  [7.5%] 18/240 frames, 14.90 fps, 892.89 kb/s, eta 0:00:14  [9.6%] 23/240 frames, 15.78 fps, 780.94 kb/s, eta 0:00:13  [11.2%] 27/240 frames, 15.39 fps, 832.36 kb/s, eta 0:00:13  [13.3%] 32/240 frames, 15.90 fps, 780.96 kb/s, eta 0:00:13  [15.8%] 38/240 frames, 16.30 fps, 755.28 kb/s, eta 0:00:12  [17.1%] 41/240 frames, 15.81 fps, 748.54 kb/s, eta 0:00:12  [18.3%] 44/240 frames, 15.43 fps, 740.98 kb/s, eta 0:00:12  [20.4%] 49/240 frames, 15.64 fps, 716.31 kb/s, eta 0:00:12  [22.1%] 53/240 frames, 15.60 fps, 703.40 kb/s, eta 0:00:11  [24.2%] 58/240 frames, 15.86 fps, 683.74 kb/s, eta 0:00:11  [26.2%] 63/240 frames, 15.94 fps, 674.29 kb/s, eta 0:00:11  [27.5%] 66/240 frames, 15.62 fps, 677.10 kb/s, eta 0:00:11  [29.2%] 70/240 frames, 15.64 fps, 668.57 kb/s, eta 0:00:10  [30.8%] 74/240 frames, 15.55 fps, 676.58 kb/s, eta 0:00:10  [33.3%] 80/240 frames, 15.85 fps, 652.72 kb/s, eta 0:00:10  [35.4%] 85/240 frames, 15.89 fps, 659.35 kb/s, eta 0:00:09  [37.9%] 91/240 frames, 16.08 fps, 656.62 kb/s, eta 0:00:09  [40.4%] 97/240 frames, 16.25 fps, 653.38 kb/s, eta 0:00:08  [42.9%] 103/240 frames, 16.53 fps, 636.65 kb/s, eta 0:00:08  [44.6%] 107/240 frames, 16.48 fps, 649.48 kb/s, eta 0:00:08  [46.7%] 112/240 frames, 16.48 fps, 643.13 kb/s, eta 0:00:07  [48.8%] 117/240 frames, 16.56 fps, 641.83 kb/s, eta 0:00:07  [51.2%] 123/240 frames, 16.70 fps, 634.97 kb/s, eta 0:00:07  [53.8%] 129/240 frames, 16.87 fps, 619.80 kb/s, eta 0:00:06  [55.8%] 134/240 frames, 16.96 fps, 608.43 kb/s, eta 0:00:06  [58.3%] 140/240 frames, 17.14 fps, 610.75 kb/s, eta 0:00:05  [61.2%] 147/240 frames, 17.43 fps, 598.85 kb/s, eta 0:00:05  [63.3%] 152/240 frames, 17.47 fps, 592.22 kb/s, eta 0:00:05  [65.4%] 157/240 frames, 17.47 fps, 597.61 kb/s, eta 0:00:04  [67.5%] 162/240 frames, 17.47 fps, 593.31 kb/s, eta 0:00:04  [69.6%] 167/240 frames, 17.45 fps, 593.63 kb/s, eta 0:00:04  [72.1%] 173/240 frames, 17.56 fps, 584.46 kb/s, eta 0:00:03  [74.2%] 178/240 frames, 17.59 fps, 581.63 kb/s, eta 0:00:03  [76.7%] 184/240 frames, 17.64 fps, 596.98 kb/s, eta 0:00:03  [78.8%] 189/240 frames, 17.66 fps, 608.79 kb/s, eta 0:00:02  [80.8%] 194/240 frames, 17.66 fps, 613.33 kb/s, eta 0:00:02  [82.5%] 198/240 frames, 17.62 fps, 622.71 kb/s, eta 0:00:02  [84.6%] 203/240 frames, 17.62 fps, 623.39 kb/s, eta 0:00:02  [86.7%] 208/240 frames, 17.63 fps, 628.69 kb/s, eta 0:00:01  [88.8%] 213/240 frames, 17.68 fps, 626.42 kb/s, eta 0:00:01  [91.2%] 219/240 frames, 17.78 fps, 625.82 kb/s, eta 0:00:01  [95.8%] 230/240 frames, 18.26 fps, 673.44 kb/s, eta 0:00:00  [99.6%] 239/240 frames, 18.59 fps, 662.51 kb/s, eta 0:00:00                                                                                 x264 [info]: frame I:2     Avg QP:19.48  size: 45946  PSNR Mean Y:47.89 U:50.19 V:51.22 Avg:48.60 Global:48.21
+x264 [info]: frame P:74    Avg QP:22.62  size:  6154  PSNR Mean Y:44.69 U:48.76 V:50.55 Avg:45.72 Global:45.27
+x264 [info]: frame B:164   Avg QP:25.98  size:   687  PSNR Mean Y:45.04 U:48.66 V:50.53 Avg:46.01 Global:45.55
+x264 [info]: consecutive B-frames:  3.8% 10.0% 16.2% 70.0%
+x264 [info]: mb I  I16..4: 18.0% 67.1% 14.9%
+x264 [info]: mb P  I16..4:  2.2%  2.6%  0.8%  P16..4: 24.7%  4.3%  3.3%  0.0%  0.0%    skip:62.2%
+x264 [info]: mb B  I16..4:  0.1%  0.0%  0.0%  B16..8: 20.0%  0.1%  0.0%  direct: 0.1%  skip:79.7%  L0:49.5% L1:50.3% BI: 0.1%
+x264 [info]: 8x8 transform intra:52.6% inter:84.7%
+x264 [info]: coded y,uvDC,uvAC intra: 50.8% 57.2% 30.6% inter: 2.6% 4.1% 0.1%
+x264 [info]: i16 v,h,dc,p: 12% 73%  2% 13%
+x264 [info]: i8 v,h,dc,ddl,ddr,vr,hd,vl,hu: 20% 32% 14%  4%  6%  6%  7%  5%  7%
+x264 [info]: i4 v,h,dc,ddl,ddr,vr,hd,vl,hu: 40% 23%  7%  4%  6%  6%  6%  4%  4%
+x264 [info]: i8c dc,h,v,p: 47% 26% 20%  8%
+x264 [info]: Weighted P-Frames: Y:0.0% UV:0.0%
+x264 [info]: ref P L0: 83.4% 11.0%  4.4%  1.2%
+x264 [info]: ref B L0: 94.8%  5.2%  0.1%
+x264 [info]: ref B L1: 97.3%  2.7%
+x264 [info]: SSIM Mean Y:0.9909359 (20.427db)
+x264 [info]: PSNR Mean Y:44.958 U:48.705 V:50.541 Avg:45.942 Global:45.478 kb/s:659.88
+
+encoded 240 frames, 18.63 fps, 659.88 kb/s

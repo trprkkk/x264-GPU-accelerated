@@ -1,0 +1,11 @@
+# Build outputs and machine-specific files
+build-msvc/
+dist/
+toolchain/
+x264-baseline.exe
+build-gpu.log
+
+# Input clips and encoded outputs
+testdata/
+*.yuv
+*.264

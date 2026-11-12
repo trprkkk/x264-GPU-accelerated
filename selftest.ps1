@@ -1,0 +1,135 @@
+# Acceptance self-test for hybrid-x264-gpu.
+# Verifies that:
+#   1) --gpu-me 0 output is bit-identical to the stock x264 baseline
+#   2) GPU modes run and exit cleanly
+#   3) GPU mode output is decodable (if ffmpeg is available)
+#   4) unsupported configurations fall back to the CPU with a warning
+#   5) repeated GPU-mode runs are deterministic (identical SHA-1)
+#   6) GPU modes do not change frame-type decisions vs mode 0
+# Usage: powershell -NoProfile -ExecutionPolicy Bypass -File selftest.ps1 [-Ffmpeg <path>]
+#   ffmpeg/ffprobe are located on PATH (or passed with -Ffmpeg); the decode and
+#   frame-type checks are skipped when they are unavailable.
+param( [string]$Ffmpeg = "" )
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $root
+New-Item -ItemType Directory -Force -Path testdata | Out-Null
+
+$exe  = Join-Path $root "build-msvc\x264.exe"
+$base = Join-Path $root "x264-baseline.exe"
+$yuv  = Join-Path $root "testdata\motion720p.yuv"
+
+$ff = $null
+if( $Ffmpeg )
+{
+    if( Test-Path $Ffmpeg ) { $ff = $Ffmpeg }
+}
+else
+{
+    $c = Get-Command ffmpeg -ErrorAction SilentlyContinue
+    if( $c ) { $ff = $c.Source }
+}
+
+if( !(Test-Path $exe) ) { Write-Host "FAIL: $exe not found (build first)" -ForegroundColor Red; exit 1 }
+if( !(Test-Path $yuv) ) { Write-Host "SKIP: $yuv not found (benchmark clip unavailable)" -ForegroundColor Yellow; exit 0 }
+
+$common = @("--crf","23","--threads","1","--frames","30","--input-res","1280x720","--fps","30")
+$fail = 0
+
+# 1) bit-exactness of mode 0 against stock x264
+if( Test-Path $base )
+{
+    & $base "--preset" "medium" @common $yuv "-o" "testdata\st_base.264" 2> $null
+    & $exe  "--preset" "medium" "--gpu-me" "0" @common $yuv "-o" "testdata\st_g0.264" 2> $null
+    $h1 = (Get-FileHash "testdata\st_base.264" -Algorithm SHA1).Hash
+    $h2 = (Get-FileHash "testdata\st_g0.264"   -Algorithm SHA1).Hash
+    if( $h1 -eq $h2 ) { Write-Host "PASS: --gpu-me 0 is bit-identical to stock x264" -ForegroundColor Green }
+    else              { Write-Host "FAIL: mode 0 mismatch ($h1 vs $h2)" -ForegroundColor Red; $fail = 1 }
+}
+else { Write-Host "SKIP: x264-baseline.exe not found, cannot verify bit-exactness" -ForegroundColor Yellow }
+
+# 2) GPU modes run and exit cleanly
+foreach( $m in 1,2,3 )
+{
+    & $exe "--preset" "slow" "--gpu-me" $m @common $yuv "-o" "testdata\st_g$m.264" 2> $null
+    if( $LASTEXITCODE -eq 0 ) { Write-Host "PASS: --gpu-me $m encode exited cleanly" -ForegroundColor Green }
+    else                      { Write-Host "FAIL: --gpu-me $m exit code $LASTEXITCODE" -ForegroundColor Red; $fail = 1 }
+
+    if( $ff )
+    {
+        & $ff "-v" "error" "-i" "testdata\st_g$m.264" "-f" "null" "NUL" 2> $null
+        if( $LASTEXITCODE -eq 0 ) { Write-Host "PASS: --gpu-me $m output decodes" -ForegroundColor Green }
+        else                      { Write-Host "FAIL: --gpu-me $m output failed to decode" -ForegroundColor Red; $fail = 1 }
+    }
+}
+
+# 2b) CUDA analysis is actually engaged (informational: CPU fallback is valid
+#     on machines without a compatible GPU/driver)
+& $exe "--preset" "slow" "--gpu-me" "2" @common $yuv "-o" "NUL" 2> "testdata\st_gpu.log"
+if( (Get-Content "testdata\st_gpu.log" -Raw) -match "CUDA ME: " ) { Write-Host "PASS: CUDA analysis active" -ForegroundColor Green }
+else { Write-Host "WARN: CUDA not active (CPU fallback)" -ForegroundColor Yellow }
+
+# 3) unsupported configuration (10-bit) falls back with a warning
+& $exe "--preset" "medium" "--gpu-me" "2" "--output-depth" "10" @common $yuv "-o" "NUL" 2> "testdata\st_10bit.log"
+$log = Get-Content "testdata\st_10bit.log" -Raw
+if( $log -match "CUDA ME.*8-bit" ) { Write-Host "PASS: 10-bit fallback warning shown" -ForegroundColor Green }
+else { Write-Host "FAIL: 10-bit fallback warning missing" -ForegroundColor Red; $fail = 1 }
+
+# 4) determinism: repeated runs of the same GPU mode must be bit-identical
+$detCommon = @("--preset","slow","--crf","23","--threads","1","--frames","80","--input-res","1280x720","--fps","30")
+foreach( $m in 1,2,3 )
+{
+    & $exe "--gpu-me" $m @detCommon $yuv "-o" "testdata\st_d${m}a.264" 2> $null
+    & $exe "--gpu-me" $m @detCommon $yuv "-o" "testdata\st_d${m}b.264" 2> $null
+    $ha = (Get-FileHash "testdata\st_d${m}a.264" -Algorithm SHA1).Hash
+    $hb = (Get-FileHash "testdata\st_d${m}b.264" -Algorithm SHA1).Hash
+    if( $ha -eq $hb ) { Write-Host "PASS: --gpu-me $m is deterministic across runs" -ForegroundColor Green }
+    else              { Write-Host "FAIL: --gpu-me $m differs between runs ($ha vs $hb)" -ForegroundColor Red; $fail = 1 }
+}
+
+# 5) GPU candidate injection must not change the lookahead's frame-type
+#    decisions: the frame type sequence has to match mode 0 exactly
+$ffprobe = $null
+if( $ff )
+{
+    $cand = Join-Path (Split-Path $ff) "ffprobe.exe"
+    if( Test-Path $cand ) { $ffprobe = $cand }
+}
+if( $ffprobe )
+{
+    & $exe "--gpu-me" "0" @detCommon $yuv "-o" "testdata\st_ft0.264" 2> $null
+    $types0 = (& $ffprobe "-v" "error" "-select_streams" "v" "-show_entries" "frame=pict_type" "-of" "csv=p=0" "testdata\st_ft0.264") -join ''
+    foreach( $m in 1,2,3 )
+    {
+        $types = (& $ffprobe "-v" "error" "-select_streams" "v" "-show_entries" "frame=pict_type" "-of" "csv=p=0" "testdata\st_d${m}a.264") -join ''
+        if( $types -eq $types0 ) { Write-Host "PASS: --gpu-me $m frame types match mode 0" -ForegroundColor Green }
+        else                     { Write-Host "FAIL: --gpu-me $m frame types differ from mode 0" -ForegroundColor Red; $fail = 1 }
+    }
+}
+else { Write-Host "SKIP: ffprobe not found, cannot verify frame-type decisions" -ForegroundColor Yellow }
+
+# 6) non-16-multiple resolution (1080p) uses the GPU when the clip is present
+$yuv1080 = Join-Path $root "testdata\test1080p.yuv"
+if( Test-Path $yuv1080 )
+{
+    $common1080 = @("--crf","23","--threads","1","--frames","30","--input-res","1920x1080","--fps","30")
+    & $exe "--preset" "medium" "--gpu-me" "2" @common1080 $yuv1080 "-o" "testdata\st_1080.264" 2> "testdata\st_1080.log"
+    $log1080 = Get-Content "testdata\st_1080.log" -Raw
+    if( ($LASTEXITCODE -eq 0) -and ($log1080 -match "CUDA ME: ") )
+        { Write-Host "PASS: 1080p (non-16-multiple) uses the GPU" -ForegroundColor Green }
+    else
+        { Write-Host "FAIL: 1080p GPU run failed (exit $LASTEXITCODE)" -ForegroundColor Red; $fail = 1 }
+
+    if( $ff )
+    {
+        & $ff "-v" "error" "-i" "testdata\st_1080.264" "-f" "null" "NUL" 2> $null
+        if( $LASTEXITCODE -eq 0 ) { Write-Host "PASS: 1080p output decodes" -ForegroundColor Green }
+        else { Write-Host "FAIL: 1080p output failed to decode" -ForegroundColor Red; $fail = 1 }
+    }
+}
+else { Write-Host "SKIP: test1080p.yuv not found, cannot verify 1080p GPU path" -ForegroundColor Yellow }
+
+Remove-Item testdata\st_*.264,testdata\st_10bit.log,testdata\st_gpu.log,testdata\st_1080.log -ErrorAction SilentlyContinue
+
+if( $fail ) { Write-Host "SELFTEST FAILED" -ForegroundColor Red; exit 1 }
+Write-Host "ALL TESTS PASSED" -ForegroundColor Green
+exit 0

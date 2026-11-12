@@ -1,0 +1,4 @@
+# Shell scripts run under sh (MSYS/Git Bash) must keep LF line endings:
+# a CRLF "#!/bin/sh" line breaks the interpreter lookup and injects stray
+# carriage returns into the dependency scanner's output.
+tools/*.sh text eol=lf
