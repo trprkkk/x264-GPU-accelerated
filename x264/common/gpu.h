@@ -1,10 +1,14 @@
 /*****************************************************************************
- * gpu.h: CUDA candidate generation for the hybrid x264 fork
+ * gpu.h: GPU candidate generation for the hybrid x264 fork
  *****************************************************************************
  * This module never makes the final coding decision.  It returns a small
  * list of integer-pel motion vectors per macroblock; the unmodified x264
  * rate-distortion code evaluates them against the real reconstructed
  * reference and remains the only authority on the output bitstream.
+ *
+ * common/gpu.c is the dispatcher for the public API below; the actual
+ * implementations live in common/gpu.cu (CUDA) and common/gpu_cl.c (OpenCL)
+ * and are selected with x264_gpu_create()'s backend argument.
  *****************************************************************************/
 
 #ifndef X264_GPU_H
@@ -20,6 +24,11 @@ extern "C" {
 #define X264_GPU_CANDS     4
 #define X264_GPU_CACHE     8
 
+/* Backend selection for x264_gpu_create(). */
+#define X264_GPU_BACKEND_AUTO   0   /* CUDA first, then OpenCL */
+#define X264_GPU_BACKEND_CUDA   1
+#define X264_GPU_BACKEND_OPENCL 2
+
 typedef struct
 {
     int16_t  mv[2];   /* full-pel, relative to the block origin */
@@ -28,12 +37,56 @@ typedef struct
 
 typedef struct x264_gpu_frame_t x264_gpu_frame_t;
 
-/* Returns NULL when CUDA is unavailable or initialisation fails. */
-void *x264_gpu_create( int width, int height, int max_refs, int device );
-void  x264_gpu_destroy( void *ctx );
-const char *x264_gpu_name( void );
+/* Every backend's frame object starts with this header so that the
+ * dispatcher can find the owning backend from an opaque frame pointer. */
+typedef struct
+{
+    int backend;      /* X264_GPU_BACKEND_* */
+} x264_gpu_frame_header_t;
 
-x264_gpu_frame_t *x264_gpu_frame_alloc( int mbw, int mbh, int nref0, int nref1 );
+typedef struct x264_gpu_backend_t
+{
+    const char *id;      /* "cuda" / "opencl" */
+    int      (*available)( void );
+    void *   (*create)( int width, int height, int max_refs, int device );
+    void     (*destroy)( void *ctx );
+    const char *(*name)( void );
+    x264_gpu_frame_t *(*frame_alloc)( int mbw, int mbh, int nref0, int nref1 );
+    void     (*frame_free)( x264_gpu_frame_t *frame );
+    int      (*analyze)( void *ctx, x264_gpu_frame_t *frame,
+                         const uint8_t *cur, int cur_stride,
+                         uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
+                         uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
+                         int range, int radius );
+    int      (*analyze_async)( void *ctx, x264_gpu_frame_t *frame,
+                               const uint8_t *cur, int cur_stride,
+                               uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
+                               uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
+                               int range, int radius );
+    int      (*finish)( void *ctx );
+    int      (*is_pending)( void *ctx, const x264_gpu_frame_t *frame );
+    int      (*pending_any)( void *ctx );
+    const x264_gpu_cand_t *(*frame_get)( const x264_gpu_frame_t *frame,
+                                         int list, const void *ref_plane, int64_t ref_id,
+                                         int mbx, int mby, int *count );
+    int      (*frame_covers)( const x264_gpu_frame_t *frame,
+                              int list, const void *ref_plane, int64_t ref_id );
+} x264_gpu_backend_t;
+
+/* Backend instances (defined in gpu.cu / gpu_cl.c). */
+extern const x264_gpu_backend_t x264_gpu_backend_cuda;
+extern const x264_gpu_backend_t x264_gpu_backend_cl;
+
+/* Create a candidate generator on the requested backend (0 = auto).
+ * Returns NULL when the selected backend is unavailable or init fails. */
+void *x264_gpu_create( int width, int height, int max_refs, int device, int backend );
+void  x264_gpu_destroy( void *ctx );
+/* Human-readable name of the active backend/device ("" when none). */
+const char *x264_gpu_name( void *ctx );
+/* Backend id of a completed create() (for logging). */
+const char *x264_gpu_backend_id( void *ctx );
+
+x264_gpu_frame_t *x264_gpu_frame_alloc( void *ctx, int mbw, int mbh, int nref0, int nref1 );
 void              x264_gpu_frame_free( x264_gpu_frame_t *frame );
 
 /* Upload the current picture and the references, run the coarse-to-fine

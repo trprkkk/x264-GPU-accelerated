@@ -421,6 +421,7 @@ typedef struct x264_param_t
         int          i_gpu_me_radius;/* full-resolution refinement radius around each coarse candidate */
         int          i_gpu_me_refs;  /* maximum reference frames analysed on the GPU (0 = all) */
         int          i_gpu_me_device;/* CUDA device index */
+        int          i_gpu_me_backend;/* 0=auto (CUDA then OpenCL), 1=CUDA, 2=OpenCL */
         int          i_mv_range; /* maximum length of a mv (in pixels). -1 = auto, based on level */
         int          i_mv_range_thread; /* minimum space between threads. -1 = auto, based on number of threads. */
         int          i_subpel_refine; /* subpixel motion estimation quality */

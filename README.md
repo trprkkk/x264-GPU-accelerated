@@ -18,13 +18,13 @@ H.264 エンコーダです。
 | 項目 | 内容 |
 |---|---|
 | 対象 | H.264/AVC (x264 フォーク、High profile / 8-bit ビルドで GPU 有効) |
-| GPU 利用 | 汎用 CUDA カーネル (NVENC/QSV 等の固定機能は不使用) |
+| GPU 利用 | 汎用 CUDA / OpenCL カーネル (NVENC/QSV 等の固定機能は不使用) |
 | 画質 | GPU は候補を「追加」するだけ。CPU が本物のコストで選び直すため、実測でも SSIM 差は ±0.00005 以内 |
 | 互換性 | 出力は通常の H.264 ストリーム。MPC-HC / ffmpeg 等でデコード可能 (検証済み) |
 | 対応解像度 | 任意 (x264 準拠。MB 境界までパディングして GPU 解析。1080p も GPU 加速) |
 | 速度 | `--me esa` / `--me tesa` で **+17〜+47%** (2 測定セッション。下記ベンチマーク) |
 | 既定動作 | `--gpu-me 0`。従来と完全に同一・ビット一致 |
-| フォールバック | CUDA 無し / 非対応条件では警告を出して自動的に CPU 動作へ |
+| フォールバック | GPU (CUDA/OpenCL) 無し / 非対応条件では警告を出して自動的に CPU 動作へ |
 
 ### モード一覧
 
@@ -46,6 +46,7 @@ H.264 エンコーダです。
 - NASM 2.16.03 (`toolchain/nasm-2.16.03` に配置済み。別バージョンでも可)
 - Git Bash + `mingw32-make` (MSYS2/MinGW の make でも可)
 - NVIDIA GPU (Compute Capability 7.5 でビルド確認: RTX 2060 SUPER)
+- OpenCL 1.2+ ランタイム (任意、`--gpu-me-backend 2` 用。動作確認: NVIDIA OpenCL 3.0)
 
 GPU 対応条件 (これ以外は自動で CPU フォールバック):
 
@@ -114,11 +115,12 @@ x264 --preset slow --crf 23 --gpu-me 2 input.yuv --input-res 1280x720 -o out.264
 
 | オプション | 既定値 | 説明 |
 |---|---|---|
-| `--gpu-me <0-3>` | `0` | GPU 動き探索モード (上記の表) |
+| `--gpu-me <0-4>` | `0` | GPU 動き探索モード (上記の表) |
+| `--gpu-me-backend <0-2>` | `0` | バックエンド: 0=自動 (CUDA→OpenCL)、1=CUDA、2=OpenCL |
 | `--gpu-me-range <int>` | `64` | 粗探索の全解像度換算サーチ範囲 (4〜128) |
 | `--gpu-me-radius <int>` | `2` | 粗探索候補周辺の全解像度リファイン半径 (0〜8) |
 | `--gpu-me-refs <int>` | `2` | GPU 解析する参照フレーム数 (0 = すべて、最大 4) |
-| `--gpu-me-device <int>` | `0` | CUDA デバイス番号 |
+| `--gpu-me-device <int>` | `0` | GPU デバイス番号 |
 
 ### 推奨構成
 
@@ -134,18 +136,19 @@ x264 --preset slow --crf 23 --gpu-me 2 input.yuv --input-res 1280x720 -o out.264
 
 ### 動作ログ
 
-CUDA が使えた場合は起動時に次のように表示されます。
+GPU が使えた場合は起動時にバックエンドとデバイスを表示します。
 
 ```
-x264 [info]: CUDA ME: NVIDIA GeForce RTX 2060 SUPER (sm_75)
+x264 [info]: GPU ME: cuda / NVIDIA GeForce RTX 2060 SUPER (sm_75)
+x264 [info]: GPU ME: opencl / NVIDIA GeForce RTX 2060 SUPER (OpenCL 3.0 CUDA)
 ```
 
 非対応条件では警告を出して CPU 動作に切り替わります。
 
 ```
-x264 [warning]: CUDA ME: interlaced coding is not supported, falling back to CPU
-x264 [warning]: CUDA ME: only supported in the 8-bit build, falling back to CPU
-x264 [warning]: CUDA ME: unable to initialise CUDA, falling back to CPU
+x264 [warning]: GPU ME: interlaced coding is not supported, falling back to CPU
+x264 [warning]: GPU ME: only supported in the 8-bit build, falling back to CPU
+x264 [warning]: GPU ME: no usable GPU backend, falling back to CPU
 ```
 
 ---
@@ -285,6 +288,7 @@ x264 [warning]: CUDA ME: unable to initialise CUDA, falling back to CPU
 | B フレーム / B-pyramid / 重み付き予測 | ✅ (preset medium/slow は既定で有効) |
 | 非 16 倍数解像度 (1920x1080 / 1280x718) | ✅ MB 境界パディングで GPU 加速 (mode 2 が CUDA 有効で動作) |
 | 非同期プリフェッチ (`X264_GPU_ASYNC`) | ✅ 出力はビット一致のまま (全回帰ハッシュ一致)。GPU 待ち時間 ≈0.002 ms/frame、実測 +1% 前後 |
+| OpenCL バックエンド (`--gpu-me-backend 2`) | ✅ CUDA とビット単位で同一ストリーム (720p/1080p、mode 2/3)。selftest で自動検証 |
 | 10-bit 出力 | ✅ 警告を出して CPU フォールバック |
 | インターレース | ✅ 警告を出して CPU フォールバック |
 | GPU モードの再現性 (同一入力・同一設定) | ✅ mode 1/2/3 の反復実行が SHA-1 一致 (240 frames placebo) |
@@ -292,7 +296,7 @@ x264 [warning]: CUDA ME: unable to initialise CUDA, falling back to CPU
 | NVENC (固定機能) との画質比較 | ✅ 5 レート帯すべてで少ないビットで高 SSIM/PSNR (BD-rate −33.6% / −40.7%) |
 | 品質ゲート (BD-rate × 3クリップ) | ✅ PASS (26比較。最悪 SSIM +1.92% は mode 3/4 の 1080p、mode 2 は +0.37% 以内) |
 | ヘッダ変更時の差分ビルド | ✅ `.d` が全インクルードヘッダを記録 (msvsdepend.sh 修正) |
-| `selftest.ps1` (受け入れテスト 17 項目) | ✅ 全合格 |
+| `selftest.ps1` (受け入れテスト 26 項目) | ✅ 全合格 |
 | フルクリーンビルド (configure から) | ✅ 再現確認済み |
 
 ---
@@ -379,7 +383,9 @@ x264_encoder_encode()
 
 | ファイル | 変更内容 |
 |---|---|
-| `common/gpu.h` / `common/gpu.cu` | 新規。CUDA モジュール本体 (カーネル、転送、キャッシュ、API) |
+| `common/gpu.h` / `common/gpu.c` | 新規。公開 API とバックエンド・ディスパッチャ |
+| `common/gpu.cu` | 新規。CUDA バックエンド (カーネル、転送、キャッシュ) |
+| `common/gpu_cl.c` | 新規。OpenCL バックエンド (CUDA と同一アルゴリズム・同一出力) |
 | `x264.h` | `x264_param_t.analyse` に `i_gpu_me*` を追加 |
 | `common/base.c` | 既定値・オプション解析・パラメータ文字列 |
 | `common/frame.h` / `frame.c` | フレームごとの候補バッファ (`gpu_me`) と解放処理 |

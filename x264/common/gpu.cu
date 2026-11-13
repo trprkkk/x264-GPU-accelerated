@@ -7,8 +7,31 @@
 // decision.  me.c evaluates every returned vector with the real x264 cost
 // function, so rate control, RDO, entropy coding and the bitstream syntax stay
 // exactly in the original CPU code.
+//
+// This file is the CUDA backend; the public API (dispatcher) is gpu.c and the
+// symbols here carry the x264_gpu_cuda_ prefix.
 
 #include "gpu.h"
+
+/* Rename the backend entry points (definitions below only; the public
+ * declarations from gpu.h keep their names and are implemented by gpu.c). */
+#define x264_gpu_create       x264_gpu_cuda_create
+#define x264_gpu_destroy      x264_gpu_cuda_destroy
+#define x264_gpu_name         x264_gpu_cuda_name
+#define x264_gpu_frame_alloc  x264_gpu_cuda_frame_alloc
+#define x264_gpu_frame_free   x264_gpu_cuda_frame_free
+#define x264_gpu_analyze      x264_gpu_cuda_analyze
+#define x264_gpu_analyze_async x264_gpu_cuda_analyze_async
+#define x264_gpu_finish       x264_gpu_cuda_finish
+#define x264_gpu_is_pending   x264_gpu_cuda_is_pending
+#define x264_gpu_pending_any  x264_gpu_cuda_pending_any
+#define x264_gpu_frame_get    x264_gpu_cuda_frame_get
+#define x264_gpu_frame_covers x264_gpu_cuda_frame_covers
+
+/* Forward declarations for calls that appear before the definitions. */
+extern "C" x264_gpu_frame_t *x264_gpu_frame_alloc( int mbw, int mbh, int nref0, int nref1 );
+extern "C" void x264_gpu_frame_free( x264_gpu_frame_t *frame );
+extern "C" int  x264_gpu_finish( void *ctx );
 
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -36,6 +59,7 @@ struct x264_gpu_ctx_t;
 
 struct x264_gpu_frame_t
 {
+    x264_gpu_frame_header_t hdr;   /* must be first: dispatcher reads it */
     int mbw, mbh;
     int nref[2];       /* allocated candidate slots per list */
     int nfilled[2];    /* references actually analysed and published */
@@ -357,6 +381,7 @@ extern "C" x264_gpu_frame_t *x264_gpu_frame_alloc( int mbw, int mbh, int nref0, 
     x264_gpu_frame_t *f = (x264_gpu_frame_t*)calloc( 1, sizeof(*f) );
     if( !f )
         return NULL;
+    f->hdr.backend = X264_GPU_BACKEND_CUDA;
     f->mbw = mbw;
     f->mbh = mbh;
     f->ncand = GK;
@@ -667,3 +692,29 @@ extern "C" int x264_gpu_frame_covers( const x264_gpu_frame_t *f,
             return 1;
     return 0;
 }
+
+/* --- backend registration ------------------------------------------------- */
+
+static int gpu_cuda_available( void )
+{
+    int ndev = 0;
+    return cudaGetDeviceCount( &ndev ) == cudaSuccess && ndev > 0;
+}
+
+extern "C" const x264_gpu_backend_t x264_gpu_backend_cuda =
+{
+    "cuda",
+    gpu_cuda_available,
+    x264_gpu_cuda_create,
+    x264_gpu_cuda_destroy,
+    x264_gpu_cuda_name,
+    x264_gpu_cuda_frame_alloc,
+    x264_gpu_cuda_frame_free,
+    x264_gpu_cuda_analyze,
+    x264_gpu_cuda_analyze_async,
+    x264_gpu_cuda_finish,
+    x264_gpu_cuda_is_pending,
+    x264_gpu_cuda_pending_any,
+    x264_gpu_cuda_frame_get,
+    x264_gpu_cuda_frame_covers,
+};

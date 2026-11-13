@@ -804,6 +804,7 @@ static void help( x264_param_t *defaults, int longhelp )
     H2( "      --gpu-me-radius <int>   GPU fullpel refinement radius [%d]\n", defaults->analyse.i_gpu_me_radius );
     H2( "      --gpu-me-refs <int>     Maximum references analysed on the GPU, 0=all [%d]\n", defaults->analyse.i_gpu_me_refs );
     H2( "      --gpu-me-device <int>   CUDA device index [%d]\n", defaults->analyse.i_gpu_me_device );
+    H2( "      --gpu-me-backend <int>  GPU backend: 0=auto (CUDA then OpenCL), 1=CUDA, 2=OpenCL [%d]\n", defaults->analyse.i_gpu_me_backend );
     H2( "      --mvrange <integer>     Maximum motion vector length [-1 (auto)]\n" );
     H2( "      --mvrange-thread <int>  Minimum buffer between threads [-1 (auto)]\n" );
     H1( "  -m, --subme <integer>       Subpixel motion estimation and mode decision [%d]\n", defaults->analyse.i_subpel_refine );
@@ -1089,6 +1090,7 @@ static struct option long_options[] =
     { "gpu-me-radius",        required_argument, NULL, 0 },
     { "gpu-me-refs",          required_argument, NULL, 0 },
     { "gpu-me-device",        required_argument, NULL, 0 },
+    { "gpu-me-backend",       required_argument, NULL, 0 },
     { "mvrange",              required_argument, NULL, 0 },
     { "mvrange-thread",       required_argument, NULL, 0 },
     { "subme",                required_argument, NULL, 'm' },

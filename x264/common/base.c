@@ -446,6 +446,7 @@ REALIGN_STACK void x264_param_default( x264_param_t *param )
     param->analyse.i_gpu_me_radius = 2;
     param->analyse.i_gpu_me_refs = 2;
     param->analyse.i_gpu_me_device = 0;
+    param->analyse.i_gpu_me_backend = 0;
     param->analyse.i_subpel_refine = 7;
     param->analyse.b_mixed_references = 1;
     param->analyse.b_chroma_me = 1;
@@ -1280,6 +1281,8 @@ REALIGN_STACK int x264_param_parse( x264_param_t *p, const char *name, const cha
         p->analyse.i_gpu_me_refs = atoi(value);
     OPT("gpu-me-device")
         p->analyse.i_gpu_me_device = atoi(value);
+    OPT("gpu-me-backend")
+        p->analyse.i_gpu_me_backend = atoi(value);
     OPT2("mvrange", "mv-range")
         p->analyse.i_mv_range = atoi(value);
     OPT2("mvrange-thread", "mv-range-thread")

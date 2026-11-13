@@ -1166,6 +1166,7 @@ static int validate_parameters( x264_t *h, int b_open )
     h->param.analyse.i_gpu_me_range = x264_clip3( h->param.analyse.i_gpu_me_range, 4, 128 );
     h->param.analyse.i_gpu_me_radius = x264_clip3( h->param.analyse.i_gpu_me_radius, 0, 8 );
     h->param.analyse.i_gpu_me_refs = x264_clip3( h->param.analyse.i_gpu_me_refs, 0, 4 );
+    h->param.analyse.i_gpu_me_backend = x264_clip3( h->param.analyse.i_gpu_me_backend, 0, 2 );
     if( h->param.analyse.i_me_method == X264_ME_TESA &&
         (h->mb.b_lossless || h->param.analyse.i_subpel_refine <= 1) )
         h->param.analyse.i_me_method = X264_ME_ESA;
@@ -1764,7 +1765,7 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
 #if BIT_DEPTH == 8
     if( h->param.analyse.i_gpu_me && h->param.b_interlaced )
     {
-        x264_log( h, X264_LOG_WARNING, "CUDA ME: interlaced coding is not supported, falling back to CPU\n" );
+        x264_log( h, X264_LOG_WARNING, "GPU ME: interlaced coding is not supported, falling back to CPU\n" );
         h->param.analyse.i_gpu_me = 0;
     }
     if( h->param.analyse.i_gpu_me )
@@ -1776,20 +1777,22 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
         int mbw = (h->param.i_width  + 15) >> 4;
         int mbh = (h->param.i_height + 15) >> 4;
         h->gpu_ctx = x264_gpu_create( mbw * 16, mbh * 16,
-                                      X264_GPU_MAX_REFS, h->param.analyse.i_gpu_me_device );
+                                      X264_GPU_MAX_REFS, h->param.analyse.i_gpu_me_device,
+                                      h->param.analyse.i_gpu_me_backend );
         if( !h->gpu_ctx )
         {
             x264_log( h, X264_LOG_WARNING,
-                      "CUDA ME: unable to initialise CUDA, falling back to CPU\n" );
+                      "GPU ME: no usable GPU backend, falling back to CPU\n" );
             h->param.analyse.i_gpu_me = 0;
         }
         else
-            x264_log( h, X264_LOG_INFO, "CUDA ME: %s\n", x264_gpu_name() );
+            x264_log( h, X264_LOG_INFO, "GPU ME: %s / %s\n",
+                      x264_gpu_backend_id( h->gpu_ctx ), x264_gpu_name( h->gpu_ctx ) );
     }
 #else
     if( h->param.analyse.i_gpu_me )
     {
-        x264_log( h, X264_LOG_WARNING, "CUDA ME: only supported in the 8-bit build, falling back to CPU\n" );
+        x264_log( h, X264_LOG_WARNING, "GPU ME: only supported in the 8-bit build, falling back to CPU\n" );
         h->param.analyse.i_gpu_me = 0;
     }
 #endif
@@ -2480,11 +2483,11 @@ static void gpu_me_analyse( x264_t *h )
         return;
 
     if( !h->fenc->gpu_me )
-        h->fenc->gpu_me = x264_gpu_frame_alloc( h->mb.i_mb_width, h->mb.i_mb_height,
+        h->fenc->gpu_me = x264_gpu_frame_alloc( h->gpu_ctx, h->mb.i_mb_width, h->mb.i_mb_height,
                                                 X264_GPU_MAX_REFS, X264_GPU_MAX_REFS );
     if( !h->fenc->gpu_me )
     {
-        x264_log( h, X264_LOG_WARNING, "CUDA ME: candidate buffer allocation failed, disabling GPU ME\n" );
+        x264_log( h, X264_LOG_WARNING, "GPU ME: candidate buffer allocation failed, disabling GPU ME\n" );
         h->param.analyse.i_gpu_me = 0;
         return;
     }
@@ -2537,7 +2540,7 @@ static void gpu_me_analyse( x264_t *h )
                           h->param.analyse.i_gpu_me_range,
                           h->param.analyse.i_gpu_me_radius ) < 0 )
     {
-        x264_log( h, X264_LOG_WARNING, "CUDA ME: analysis failed, disabling GPU ME\n" );
+        x264_log( h, X264_LOG_WARNING, "GPU ME: analysis failed, disabling GPU ME\n" );
         h->param.analyse.i_gpu_me = 0;
     }
 }
@@ -2649,7 +2652,7 @@ static void gpu_me_prefetch( x264_t *h )
     }
 
     if( !next->gpu_me )
-        next->gpu_me = x264_gpu_frame_alloc( h->mb.i_mb_width, h->mb.i_mb_height,
+        next->gpu_me = x264_gpu_frame_alloc( h->gpu_ctx, h->mb.i_mb_width, h->mb.i_mb_height,
                                              X264_GPU_MAX_REFS, X264_GPU_MAX_REFS );
     if( !next->gpu_me )
         return;
@@ -2661,7 +2664,7 @@ static void gpu_me_prefetch( x264_t *h )
                                 h->param.analyse.i_gpu_me_range,
                                 h->param.analyse.i_gpu_me_radius ) < 0 )
     {
-        x264_log( h, X264_LOG_WARNING, "CUDA ME: analysis failed, disabling GPU ME\n" );
+        x264_log( h, X264_LOG_WARNING, "GPU ME: analysis failed, disabling GPU ME\n" );
         h->param.analyse.i_gpu_me = 0;
     }
 }

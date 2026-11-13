@@ -269,11 +269,15 @@ endif
 endif
 
 ifeq ($(HAVE_CUDA),1)
-OBJCU = common/gpu.o
+OBJCU = common/gpu.o common/gpu_cuda.o common/gpu_cl.o
 OBJS += $(OBJCU)
-LDFLAGSCLI += $(CUDALIBS)
-common/gpu.o: common/gpu.cu $(SRCPATH)/common/gpu.h
+LDFLAGSCLI += $(CUDALIBS) $(OPENCL_LIB)
+common/gpu.o: common/gpu.c $(SRCPATH)/common/gpu.h
+	$(CC) $(CFLAGS) -c $< $(CC_O)
+common/gpu_cuda.o: common/gpu.cu $(SRCPATH)/common/gpu.h
 	"$(NVCC)" $(CUDAFLAGS) -c $< -o $@
+common/gpu_cl.o: common/gpu_cl.c $(SRCPATH)/common/gpu.h
+	$(CC) $(CFLAGS) $(OPENCL_INC) -c $< $(CC_O)
 endif
 
 ifeq ($(HAVE_OPENCL),yes)

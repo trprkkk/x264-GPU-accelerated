@@ -1,0 +1,42 @@
+# Phase 4: OpenCL backend (2026-11-14)
+
+## Why
+
+The GPU candidate generator was CUDA-only.  NVIDIA GPUs also implement
+OpenCL (the RTX 2060 SUPER reports OpenCL 3.0), so an OpenCL backend can be
+implemented and verified on this machine; only cross-vendor validation
+(AMD/Intel) remains out of scope.
+
+## What was built
+
+* `common/gpu.h` now declares a small backend table; `common/gpu.c` is the
+  dispatcher implementing the public API, `common/gpu.cu` is the CUDA
+  backend and `common/gpu_cl.c` the OpenCL backend (kernels mirror the CUDA
+  ones line for line: same iteration order and strict comparisons).
+* `--gpu-me-backend 0|1|2` selects auto (CUDA then OpenCL), CUDA or OpenCL.
+  The backend is *not* part of the parameter string written into the SEI, so
+  streams can be compared byte-for-byte across backends.
+* Transfers use the same design as the CUDA backend: pinned staging for
+  reference uploads and candidate readbacks (`CL_MEM_ALLOC_HOST_PTR`), so the
+  asynchronous prefetch keeps working.
+
+## Verification (NVIDIA GeForce RTX 2060 SUPER, OpenCL 3.0)
+
+| check | result |
+|---|---|
+| `--preset placebo --gpu-me 2` 240 f | CUDA `965066A7...` == OpenCL `965066A7...` (bit-identical) |
+| `--preset placebo --gpu-me 3` 240 f | CUDA `B3090B30...` == OpenCL `B3090B30...` |
+| 1080p (non-16-multiple) mode 2 | CUDA `5090F075...` == OpenCL `5090F075...` |
+| selftest | 26/26, incl. "OpenCL backend output is bit-identical to CUDA" |
+| speed sanity (esa 24, mode 2, 240 f, single thread) | CUDA 8.82 s vs OpenCL 9.17 s (+4 %) |
+
+The OpenCL backend is slower than CUDA on this machine (different driver
+path); it exists for portability, and both produce the same bitstream.
+
+## Notes
+
+* Both backends are compiled into `x264.exe`; auto-selection prefers CUDA.
+* Building requires the OpenCL headers/import library (the CUDA toolkit ships
+  `include/CL` and `lib/x64/OpenCL.lib`; `configure-msvc.sh` wires them up).
+* Cross-vendor (AMD/Intel) validation was not possible here; the kernels use
+  only portable OpenCL C 1.2 features.

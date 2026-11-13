@@ -1,4 +1,4 @@
-﻿# Acceptance self-test for hybrid-x264-gpu.
+# Acceptance self-test for hybrid-x264-gpu.
 # Verifies that:
 #   1) --gpu-me 0 output is bit-identical to the stock x264 baseline
 #   2) GPU modes run and exit cleanly
@@ -65,13 +65,13 @@ foreach( $m in 1,2,3,4 )
 # 2b) CUDA analysis is actually engaged (informational: CPU fallback is valid
 #     on machines without a compatible GPU/driver)
 & $exe "--preset" "slow" "--gpu-me" "2" @common $yuv "-o" "NUL" 2> "testdata\st_gpu.log"
-if( (Get-Content "testdata\st_gpu.log" -Raw) -match "CUDA ME: " ) { Write-Host "PASS: CUDA analysis active" -ForegroundColor Green }
+if( (Get-Content "testdata\st_gpu.log" -Raw) -match "GPU ME: " ) { Write-Host "PASS: CUDA analysis active" -ForegroundColor Green }
 else { Write-Host "WARN: CUDA not active (CPU fallback)" -ForegroundColor Yellow }
 
 # 3) unsupported configuration (10-bit) falls back with a warning
 & $exe "--preset" "medium" "--gpu-me" "2" "--output-depth" "10" @common $yuv "-o" "NUL" 2> "testdata\st_10bit.log"
 $log = Get-Content "testdata\st_10bit.log" -Raw
-if( $log -match "CUDA ME.*8-bit" ) { Write-Host "PASS: 10-bit fallback warning shown" -ForegroundColor Green }
+if( $log -match "GPU ME.*8-bit" ) { Write-Host "PASS: 10-bit fallback warning shown" -ForegroundColor Green }
 else { Write-Host "FAIL: 10-bit fallback warning missing" -ForegroundColor Red; $fail = 1 }
 
 # 4) determinism: repeated runs of the same GPU mode must be bit-identical
@@ -114,7 +114,7 @@ if( Test-Path $yuv1080 )
     $common1080 = @("--crf","23","--threads","1","--frames","30","--input-res","1920x1080","--fps","30")
     & $exe "--preset" "medium" "--gpu-me" "2" @common1080 $yuv1080 "-o" "testdata\st_1080.264" 2> "testdata\st_1080.log"
     $log1080 = Get-Content "testdata\st_1080.log" -Raw
-    if( ($LASTEXITCODE -eq 0) -and ($log1080 -match "CUDA ME: ") )
+    if( ($LASTEXITCODE -eq 0) -and ($log1080 -match "GPU ME: ") )
         { Write-Host "PASS: 1080p (non-16-multiple) uses the GPU" -ForegroundColor Green }
     else
         { Write-Host "FAIL: 1080p GPU run failed (exit $LASTEXITCODE)" -ForegroundColor Red; $fail = 1 }
@@ -158,7 +158,19 @@ else { Write-Host "FAIL: zones encode exit $LASTEXITCODE" -ForegroundColor Red; 
 if( $LASTEXITCODE -eq 0 ) { Write-Host "PASS: --threads 4 --sliced-threads with GPU mode" -ForegroundColor Green }
 else { Write-Host "FAIL: threaded encode exit $LASTEXITCODE" -ForegroundColor Red; $fail = 1 }
 
-Remove-Item testdata\st_*.264,testdata\st_10bit.log,testdata\st_gpu.log,testdata\st_1080.log,testdata\st_stats.log,testdata\st_stats.log.mbtree,testdata\st.qpfile -ErrorAction SilentlyContinue
+# 8) OpenCL backend (when available) produces the same stream as CUDA
+& $exe "--preset" "slow" "--gpu-me" "2" @common $yuv "-o" "testdata\st_ocl_a.264" 2> "testdata\st_ocl_a.log"
+& $exe "--preset" "slow" "--gpu-me" "2" "--gpu-me-backend" "2" @common $yuv "-o" "testdata\st_ocl_b.264" 2> "testdata\st_ocl_b.log"
+if( (Get-Content "testdata\st_ocl_b.log" -Raw) -match "GPU ME: opencl" )
+{
+    $ha = (Get-FileHash "testdata\st_ocl_a.264" -Algorithm SHA1).Hash
+    $hb = (Get-FileHash "testdata\st_ocl_b.264" -Algorithm SHA1).Hash
+    if( $ha -eq $hb ) { Write-Host "PASS: OpenCL backend output is bit-identical to CUDA" -ForegroundColor Green }
+    else { Write-Host "FAIL: OpenCL output differs from CUDA ($ha vs $hb)" -ForegroundColor Red; $fail = 1 }
+}
+else { Write-Host "SKIP: OpenCL backend not available" -ForegroundColor Yellow }
+
+Remove-Item testdata\st_*.264,testdata\st_10bit.log,testdata\st_gpu.log,testdata\st_1080.log,testdata\st_stats.log,testdata\st_stats.log.mbtree,testdata\st.qpfile,testdata\st_ocl_a.log,testdata\st_ocl_b.log -ErrorAction SilentlyContinue
 
 if( $fail ) { Write-Host "SELFTEST FAILED" -ForegroundColor Red; exit 1 }
 Write-Host "ALL TESTS PASSED" -ForegroundColor Green
