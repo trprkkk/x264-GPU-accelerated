@@ -1162,7 +1162,7 @@ static int validate_parameters( x264_t *h, int b_open )
     h->param.analyse.i_me_range = x264_clip3( h->param.analyse.i_me_range, 4, 1024 );
     if( h->param.analyse.i_me_range > 16 && h->param.analyse.i_me_method <= X264_ME_HEX )
         h->param.analyse.i_me_range = 16;
-    h->param.analyse.i_gpu_me = x264_clip3( h->param.analyse.i_gpu_me, 0, 3 );
+    h->param.analyse.i_gpu_me = x264_clip3( h->param.analyse.i_gpu_me, 0, 4 );
     h->param.analyse.i_gpu_me_range = x264_clip3( h->param.analyse.i_gpu_me_range, 4, 128 );
     h->param.analyse.i_gpu_me_radius = x264_clip3( h->param.analyse.i_gpu_me_radius, 0, 8 );
     h->param.analyse.i_gpu_me_refs = x264_clip3( h->param.analyse.i_gpu_me_refs, 0, 4 );
@@ -2453,6 +2453,20 @@ static inline void reference_build_list( x264_t *h, int i_poc )
 }
 
 #if HAVE_CUDA && BIT_DEPTH == 8
+/* 1 when the frame's published candidates cover the analysed part of the
+ * current reference lists. */
+static int gpu_refs_covered( x264_t *h, int list, int nref )
+{
+    for( int i = 0; i < nref; i++ )
+    {
+        x264_frame_t *r = h->fref[list][i];
+        if( !x264_gpu_frame_covers( (const x264_gpu_frame_t*)h->fenc->gpu_me, list,
+                                    r->plane[0], r->i_frame ) )
+            return 0;
+    }
+    return 1;
+}
+
 /* Run the CUDA candidate generator for the current frame after the reference
  * lists have been finalised.  The result is only a list of integer-pel
  * candidates; me.c still evaluates every one of them with the real x264 cost
@@ -2485,6 +2499,15 @@ static void gpu_me_analyse( x264_t *h )
     }
     nref0 = X264_MIN( nref0, X264_GPU_MAX_REFS );
     nref1 = X264_MIN( nref1, X264_GPU_MAX_REFS );
+
+    /* A prefetched analysis (launched at the end of the previous encode) is
+     * used when it covers the final reference lists; otherwise the
+     * synchronous analysis below runs, so the stream is unchanged. */
+    if( x264_gpu_pending_any( h->gpu_ctx ) )
+        x264_gpu_finish( h->gpu_ctx );
+    if( h->fenc->gpu_me &&
+        gpu_refs_covered( h, 0, nref0 ) && gpu_refs_covered( h, 1, nref1 ) )
+        return;
     if( !nref0 && !nref1 )
         return;
 
@@ -2518,8 +2541,135 @@ static void gpu_me_analyse( x264_t *h )
         h->param.analyse.i_gpu_me = 0;
     }
 }
+
+/* Launch the CUDA analysis for the next frame ahead of time so it overlaps
+ * with the rest of the current encode (NAL output and the next frame's CPU
+ * prologue).  The next frame's reference lists are predicted from the DPB --
+ * the same set reference_build_list() picks from -- and the results are only
+ * used when they cover the final lists (see gpu_me_analyse), so the
+ * bitstream is unchanged. */
+static void gpu_me_prefetch( x264_t *h )
+{
+    /* X264_GPU_ASYNC=0 keeps the synchronous path (A/B switch and kill
+     * switch). Default: enabled. */
+    static int async_enabled = -1;
+    if( async_enabled < 0 )
+    {
+        const char *ev = getenv( "X264_GPU_ASYNC" );
+        async_enabled = !ev || atoi( ev ) != 0;
+    }
+    if( !async_enabled )
+        return;
+    if( !h->param.analyse.i_gpu_me || !h->gpu_ctx || !h->fdec ||
+        h->param.b_interlaced || h->param.i_threads != 1 || h->param.rc.b_stat_read )
+        return;
+    if( x264_gpu_pending_any( h->gpu_ctx ) )
+        return;
+    x264_frame_t *next = h->frames.current[0];
+    if( !next || !next->plane[0] || !h->mb.i_mb_width || !h->mb.i_mb_height )
+        return;
+    if( next->i_type == X264_TYPE_I || next->i_type == X264_TYPE_IDR )
+        return;
+
+    /* Candidate pool: the next frame's DPB = current reconstruction (when it
+     * is kept) plus the existing reference frames. */
+    x264_frame_t *pool[X264_REF_MAX + 3];
+    int npool = 0;
+    if( h->fdec->b_kept_as_ref )
+        pool[npool++] = h->fdec;
+    for( int i = 0; h->frames.reference[i] && npool < (int)(sizeof(pool)/sizeof(pool[0])); i++ )
+        if( !h->frames.reference[i]->b_corrupt )
+            pool[npool++] = h->frames.reference[i];
+
+    int maxrefs = h->param.analyse.i_gpu_me_refs;
+    if( maxrefs <= 0 || maxrefs > X264_GPU_MAX_REFS )
+        maxrefs = X264_GPU_MAX_REFS;
+    int taken[X264_REF_MAX + 3] = {0};
+    x264_frame_t *list0[X264_GPU_MAX_REFS], *list1[X264_GPU_MAX_REFS];
+    int n0 = 0, n1 = 0;
+    /* Nearest past references, split and ordered like reference_build_list()
+     * does per direction (reference_distance is |i_frame distance|).  i_poc
+     * cannot be used here: it is only assigned while the frame is encoded. */
+    for( int r = 0; r < maxrefs; r++ )
+    {
+        int best = -1, bestd = 0;
+        for( int i = 0; i < npool; i++ )
+        {
+            if( taken[i] || pool[i]->i_frame >= next->i_frame )
+                continue;
+            int d = abs( next->i_frame - pool[i]->i_frame );
+            if( best < 0 || d < bestd )
+            {
+                best = i;
+                bestd = d;
+            }
+        }
+        if( best < 0 )
+            break;
+        taken[best] = 1;
+        list0[n0++] = pool[best];
+    }
+    /* nearest future references (list1) */
+    for( int r = 0; r < maxrefs; r++ )
+    {
+        int best = -1, bestd = 0;
+        for( int i = 0; i < npool; i++ )
+        {
+            if( taken[i] || pool[i]->i_frame <= next->i_frame )
+                continue;
+            int d = abs( next->i_frame - pool[i]->i_frame );
+            if( best < 0 || d < bestd )
+            {
+                best = i;
+                bestd = d;
+            }
+        }
+        if( best < 0 )
+            break;
+        taken[best] = 1;
+        list1[n1++] = pool[best];
+    }
+    if( !n0 && !n1 )
+        return;
+
+    uint8_t *refs0[X264_GPU_MAX_REFS], *refs1[X264_GPU_MAX_REFS];
+    int64_t ids0[X264_GPU_MAX_REFS], ids1[X264_GPU_MAX_REFS];
+    int strides0[X264_GPU_MAX_REFS], strides1[X264_GPU_MAX_REFS];
+    for( int i = 0; i < n0; i++ )
+    {
+        refs0[i] = (uint8_t*)list0[i]->plane[0];
+        ids0[i] = list0[i]->i_frame;
+        strides0[i] = list0[i]->i_stride[0];
+    }
+    for( int i = 0; i < n1; i++ )
+    {
+        refs1[i] = (uint8_t*)list1[i]->plane[0];
+        ids1[i] = list1[i]->i_frame;
+        strides1[i] = list1[i]->i_stride[0];
+    }
+
+    if( !next->gpu_me )
+        next->gpu_me = x264_gpu_frame_alloc( h->mb.i_mb_width, h->mb.i_mb_height,
+                                             X264_GPU_MAX_REFS, X264_GPU_MAX_REFS );
+    if( !next->gpu_me )
+        return;
+
+    if( x264_gpu_analyze_async( h->gpu_ctx, (x264_gpu_frame_t*)next->gpu_me,
+                                (const uint8_t*)next->plane[0], next->i_stride[0],
+                                refs0, ids0, strides0, n0,
+                                refs1, ids1, strides1, n1,
+                                h->param.analyse.i_gpu_me_range,
+                                h->param.analyse.i_gpu_me_radius ) < 0 )
+    {
+        x264_log( h, X264_LOG_WARNING, "CUDA ME: analysis failed, disabling GPU ME\n" );
+        h->param.analyse.i_gpu_me = 0;
+    }
+}
 #else
 static void gpu_me_analyse( x264_t *h )
+{
+}
+static void gpu_me_prefetch( x264_t *h )
 {
 }
 #endif
@@ -3591,6 +3741,13 @@ int     x264_encoder_encode( x264_t *h,
     }
     x264_ratecontrol_zone_init( h );
 
+#if HAVE_CUDA && BIT_DEPTH == 8
+    /* Complete a prefetched analysis before reference_update() can drop (and
+     * free) frames that the asynchronous copies may still be reading. */
+    if( h->gpu_ctx && x264_gpu_pending_any( h->gpu_ctx ) )
+        x264_gpu_finish( h->gpu_ctx );
+#endif
+
     // ok to call this before encoding any frames, since the initial values of fdec have b_kept_as_ref=0
     if( reference_update( h ) )
         return -1;
@@ -4013,6 +4170,8 @@ int     x264_encoder_encode( x264_t *h,
     else
         if( (intptr_t)slices_write( h ) )
             return -1;
+
+    gpu_me_prefetch( h );
 
     return encoder_frame_end( thread_oldest, thread_current, pp_nal, pi_nal, pic_out );
 }
@@ -4695,6 +4854,7 @@ void    x264_encoder_close  ( x264_t *h )
 #if HAVE_CUDA
     x264_gpu_destroy( gpu_ctx );
 #endif
+    x264_me_prof_print();
 #if HAVE_OPENCL
     x264_opencl_close_library( ocl );
 #endif

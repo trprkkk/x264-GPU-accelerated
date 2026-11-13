@@ -799,7 +799,7 @@ static void help( x264_param_t *defaults, int longhelp )
         "                                  - tesa: hadamard exhaustive search (slow)\n" );
     else H1( "                                  - dia, hex, umh\n" );
     H2( "      --merange <integer>     Maximum motion vector search range [%d]\n", defaults->analyse.i_me_range );
-    H2( "      --gpu-me <integer>      CUDA motion search: 0=off, 1=seed 16x16, 2=seed+local, 3=no CPU fullpel [%d]\n", defaults->analyse.i_gpu_me );
+    H2( "      --gpu-me <integer>      CUDA motion search: 0=off, 1=seed 16x16, 2=seed+local(+-4), 3=no CPU fullpel, 4=seed+local(+-1) [%d]\n", defaults->analyse.i_gpu_me );
     H2( "      --gpu-me-range <int>    GPU coarse search range in luma pixels [%d]\n", defaults->analyse.i_gpu_me_range );
     H2( "      --gpu-me-radius <int>   GPU fullpel refinement radius [%d]\n", defaults->analyse.i_gpu_me_radius );
     H2( "      --gpu-me-refs <int>     Maximum references analysed on the GPU, 0=all [%d]\n", defaults->analyse.i_gpu_me_refs );

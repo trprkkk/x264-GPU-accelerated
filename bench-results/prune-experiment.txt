@@ -1,0 +1,59 @@
+# Phase 2 experiment: per-reference pruning by GPU-SAD ratio (2026-11-14)
+
+## What was tried
+
+`--gpu-me-prune <pct>` (modes 2/3): for every macroblock, a reference whose
+best approximate GPU SAD exceeds `pct`% of the best of the other analysed
+references was handled with reduced CPU effort.  Three actions were measured
+(selectable during tuning with `X264_GPU_PRUNE_ACTION`):
+
+* `radius1` - CPU search only +-1 around the GPU candidates (no full +-4 search)
+* `subpel`  - full CPU search, sub-pel refinement skipped
+* `both`    - full-pel search and sub-pel refinement both skipped (default)
+
+Reference (pruning off) is bit-identical to the previous binary.
+
+## Measured (motion720p, 240 frames, CRF 23, --threads 1, --me esa --merange 24)
+
+Interleaved repeats (3x each), `--gpu-me 2`, prune threshold 130%:
+
+| variant           | avg fps | delta  |
+|-------------------|--------:|-------:|
+| prune off         |   27.30 |      - |
+| prune 130 radius1 |   27.19 |  -0.4% |
+
+Single/interleaved runs, same settings:
+
+| variant          | fps   | delta |
+|------------------|------:|------:|
+| prune 130 subpel | ~26.7 |  -8%  |
+| prune 130 both   | ~26.6 |  -8%  |
+
+ME profiler (`X264_ME_PROF=1`, same clip/settings):
+
+| variant        | ME calls | ME time | total span |
+|----------------|---------:|--------:|-----------:|
+| prune off      |   6.86 M |  5.09 s |     8.77 s |
+| prune 130 both |   8.21 M |  5.54 s |     9.59 s |
+
+Bitrate rose from 648.80 kb/s to ~653.8 kb/s (+0.77%) with pruning on.
+
+Additional spot checks (radius1, threshold 130): `--preset slow` single pairs
++1.6..+2.8% (within run-to-run noise of this machine, which reaches +-5%),
+`--preset placebo` +1.6% (single pair, inconclusive).  No reliable gain.
+
+## Why it does not work
+
+x264's analysis is driven by cost thresholds.  Any pruning that *inflates the
+reported cost* of a reference (skipping the search that would have improved
+it) makes the encoder evaluate *more* alternatives: ME calls rose by 20% and
+the total time grew even though per-call work shrank.  The saved search work
+is outweighed by the cascade, and the stream changes (slightly more bits).
+
+## Conclusion
+
+Not adopted.  The option and code were removed; this note and the code
+snapshot (`source-snapshot-with-prune.diff`) keep the experiment reproducible.
+Effort reduction stays with the existing global knobs (mode 2 radius, mode 3
+full-pel skip) and is pursued further through *better GPU candidates* rather
+than through per-reference cost distortion.

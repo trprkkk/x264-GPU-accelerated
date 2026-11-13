@@ -32,13 +32,22 @@ typedef struct
     uint32_t sad;
 } Cand;
 
+struct x264_gpu_ctx_t;
+
 struct x264_gpu_frame_t
 {
     int mbw, mbh;
     int nref[2];       /* allocated candidate slots per list */
-    int nfilled[2];    /* references actually analysed for the current frame */
+    int nfilled[2];    /* references actually analysed and published */
+    int pending[2];    /* analysed but not yet published (async prefetch) */
     int ncand;
+    /* Reference identity of every analysed slot.  The analysis may run for a
+     * predicted reference set before the final lists are known, so me.c
+     * matches its (list, ref) against these identities. */
+    const void *slot_ptr[2][X264_GPU_MAX_REFS];
+    int64_t     slot_id[2][X264_GPU_MAX_REFS];
     Cand *cand[2][X264_GPU_MAX_REFS];
+    struct x264_gpu_ctx_t *ctx;    /* owner, for sync-on-free */
 };
 
 struct x264_gpu_ctx_t
@@ -51,10 +60,18 @@ struct x264_gpu_ctx_t
     cudaStream_t stream;
     std::mutex lock;
     int disabled;
+    x264_gpu_frame_t *pending_frame;   /* analysis in flight (async prefetch) */
+    uint8_t *h_ref;            /* pinned staging for reference uploads */
+    Cand    *h_out;            /* pinned staging for candidate D2H copies */
     /* Optional per-stage timing (enabled with X264_GPU_TIMING=1). */
     int timing;
     long long nframes;
     double t_upload_cur, t_upload_ref, t_down, t_coarse, t_refine, t_d2h, t_sync;
+    double t_finish;          /* wait for a prefetched analysis */
+    long long n_finish;
+    double t_call;            /* wall time inside x264_gpu_analyze*() */
+    long long n_call;
+    int prof;                 /* X264_GPU_PROF=1: print call-time stats */
     /* Reference plane cache.  Keyed by the source frame pointer and its
      * presentation number, because x264 recycles frame objects. */
     struct CacheEntry
@@ -250,6 +267,7 @@ extern "C" void *x264_gpu_create( int width, int height, int max_refs, int devic
     c->device = device;
     c->disabled = 0;
     c->timing = getenv( "X264_GPU_TIMING" ) != NULL;
+    c->prof = getenv( "X264_GPU_PROF" ) != NULL;
     if( c->timing )
         printf( "x264 CUDA ME timing: %dx%d, %d refs, device %d\n", width, height, c->max_refs, device );
 
@@ -261,7 +279,9 @@ extern "C" void *x264_gpu_create( int width, int height, int max_refs, int devic
         cudaMalloc( (void**)&c->d_cur, fsz ) != cudaSuccess ||
         cudaMalloc( (void**)&c->d_cur_low, lsz ) != cudaSuccess ||
         cudaMalloc( (void**)&c->d_coarse, csz ) != cudaSuccess ||
-        cudaMalloc( (void**)&c->d_out, csz ) != cudaSuccess )
+        cudaMalloc( (void**)&c->d_out, csz ) != cudaSuccess ||
+        cudaMallocHost( (void**)&c->h_ref, fsz ) != cudaSuccess ||
+        cudaMallocHost( (void**)&c->h_out, 2 * X264_GPU_MAX_REFS * csz ) != cudaSuccess )
         fail = 1;
     for( int i = 0; i < X264_GPU_CACHE && !fail; i++ )
         if( cudaMalloc( (void**)&c->cache[i].full, fsz ) != cudaSuccess ||
@@ -274,6 +294,8 @@ extern "C" void *x264_gpu_create( int width, int height, int max_refs, int devic
         if( c->d_cur_low ) cudaFree( c->d_cur_low );
         if( c->d_coarse ) cudaFree( c->d_coarse );
         if( c->d_out ) cudaFree( c->d_out );
+        if( c->h_ref ) cudaFreeHost( c->h_ref );
+        if( c->h_out ) cudaFreeHost( c->h_out );
         for( int i = 0; i < X264_GPU_CACHE; i++ )
         {
             if( c->cache[i].full ) cudaFree( c->cache[i].full );
@@ -302,12 +324,21 @@ extern "C" void x264_gpu_destroy( void *ctx )
                 c->t_sync / n,
                 (c->t_upload_cur + c->t_upload_ref + c->t_down + c->t_coarse
                  + c->t_refine + c->t_d2h + c->t_sync) / n );
+        if( c->n_finish )
+            printf( "x264 CUDA ME timing: prefetch finish wait %.3f ms over %lld finishes\n",
+                    c->t_finish / n, c->n_finish );
     }
+    if( c->prof && c->n_call )
+        printf( "x264 CUDA ME profile: x264_gpu_analyze*() call %.3f ms on average over %lld calls\n",
+                c->t_call / c->n_call, c->n_call );
+    if( c->stream ) cudaStreamSynchronize( c->stream );
     if( c->stream ) cudaStreamDestroy( c->stream );
     if( c->d_cur ) cudaFree( c->d_cur );
     if( c->d_cur_low ) cudaFree( c->d_cur_low );
     if( c->d_coarse ) cudaFree( c->d_coarse );
     if( c->d_out ) cudaFree( c->d_out );
+    if( c->h_ref ) cudaFreeHost( c->h_ref );
+    if( c->h_out ) cudaFreeHost( c->h_out );
     for( int i = 0; i < X264_GPU_CACHE; i++ )
     {
         if( c->cache[i].full ) cudaFree( c->cache[i].full );
@@ -352,6 +383,10 @@ extern "C" void x264_gpu_frame_free( x264_gpu_frame_t *f )
 {
     if( !f )
         return;
+    /* Never free candidate memory that an in-flight D2H copy may still be
+     * writing to. */
+    if( f->ctx && f->ctx->pending_frame == f )
+        x264_gpu_finish( f->ctx );
     for( int l = 0; l < 2; l++ )
         for( int r = 0; r < f->nref[l]; r++ )
             free( f->cand[l][r] );
@@ -371,11 +406,39 @@ static int upload_plane( cudaStream_t st, uint8_t *dst, const uint8_t *src,
                               cudaMemcpyHostToDevice, st ) == cudaSuccess ? 0 : -1;
 }
 
-extern "C" int x264_gpu_analyze( void *ctx, x264_gpu_frame_t *frame,
-                                 const uint8_t *cur, int cur_stride,
-                                 uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
-                                 uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
-                                 int range, int radius )
+/* Upload through a pinned staging buffer: pageable sources would make the
+ * asynchronous copy synchronise the stream, which serialises the whole
+ * analysis onto the calling thread. */
+static int upload_plane_pinned( cudaStream_t st, uint8_t *dst, const uint8_t *src,
+                                int stride, int width, int height, uint8_t *stage )
+{
+    if( !src || !stage || stride < width )
+        return -1;
+    if( stride == width )
+        memcpy( stage, src, (size_t)width * height );
+    else
+        for( int y = 0; y < height; y++ )
+            memcpy( stage + (size_t)y * width, src + (size_t)y * stride, width );
+    return cudaMemcpyAsync( dst, stage, (size_t)width * height,
+                            cudaMemcpyHostToDevice, st ) == cudaSuccess ? 0 : -1;
+}
+
+/* Copy the staged candidates into the frame after the stream has been
+ * synchronised. */
+static void publish_candidates( x264_gpu_ctx_t *c, x264_gpu_frame_t *frame, int list, int nref )
+{
+    size_t n = (size_t)c->mbw * c->mbh * GK * sizeof(Cand);
+    for( int r = 0; r < nref; r++ )
+        memcpy( frame->cand[list][r],
+                c->h_out + (size_t)(list * X264_GPU_MAX_REFS + r) * (c->mbw * c->mbh * GK),
+                n );
+}
+
+static int gpu_analyze_common( void *ctx, x264_gpu_frame_t *frame,
+                               const uint8_t *cur, int cur_stride,
+                               uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
+                               uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
+                               int range, int radius, int b_sync )
 {
     x264_gpu_ctx_t *c = (x264_gpu_ctx_t*)ctx;
     if( !c || !frame || c->disabled )
@@ -390,9 +453,16 @@ extern "C" int x264_gpu_analyze( void *ctx, x264_gpu_frame_t *frame,
     std::lock_guard<std::mutex> guard( c->lock );
 
     /* Candidates are only valid for the references analysed in this call;
-     * anything else must fall back to the CPU search. */
+     * anything else must fall back to the CPU search.  In async mode nothing
+     * is published until x264_gpu_finish() has synchronised the stream. */
     frame->nfilled[0] = 0;
     frame->nfilled[1] = 0;
+    frame->pending[0] = 0;
+    frame->pending[1] = 0;
+    frame->ctx = c;
+    if( !b_sync )
+        c->pending_frame = frame;
+    double t_call0 = c->prof ? gpu_now_ms() : 0;
 
     int lw = c->lw, lh = c->lh;
     dim3 blk( 16, 16 );
@@ -423,6 +493,9 @@ extern "C" int x264_gpu_analyze( void *ctx, x264_gpu_frame_t *frame,
             nref = frame->nref[list];
         for( int r = 0; r < nref; r++ )
         {
+            /* Remember which reference this slot belongs to. */
+            frame->slot_ptr[list][r] = refs[r];
+            frame->slot_id[list][r] = ids[r];
             /* Reuse the device copy of a reference plane while its content
              * stays the same.  References are typically re-analysed every
              * frame, so this removes most of the PCIe traffic. */
@@ -439,7 +512,7 @@ extern "C" int x264_gpu_analyze( void *ctx, x264_gpu_frame_t *frame,
                 int slot = c->cache_next++ % X264_GPU_CACHE;
                 d_ref = c->cache[slot].full;
                 d_ref_low = c->cache[slot].low;
-                if( upload_plane( c->stream, d_ref, refs[r], strides[r], c->w, c->h ) < 0 )
+                if( upload_plane_pinned( c->stream, d_ref, refs[r], strides[r], c->w, c->h, c->h_ref ) < 0 )
                     goto fail;
                 TIM_MARK( t_upload_ref );
                 downsample4<<<grd, blk, 0, c->stream>>>( d_ref, c->w, c->h,
@@ -456,17 +529,33 @@ extern "C" int x264_gpu_analyze( void *ctx, x264_gpu_frame_t *frame,
                 c->d_cur, c->w, c->h, d_ref, c->w, c->h,
                 c->mbw, c->mbh, radius, c->d_coarse, c->d_out );
             TIM_MARK( t_refine );
-            if( cudaMemcpyAsync( frame->cand[list][r], c->d_out,
-                                 (size_t)total * sizeof(Cand),
+            /* Stage the D2H through pinned memory: writing directly into the
+             * frame's pageable candidate buffer would synchronise the stream
+             * and serialise the analysis onto the calling thread. */
+            if( cudaMemcpyAsync( c->h_out + (size_t)(list * X264_GPU_MAX_REFS + r) * total,
+                                 c->d_out, (size_t)total * sizeof(Cand),
                                  cudaMemcpyDeviceToHost, c->stream ) != cudaSuccess )
                 goto fail;
             TIM_MARK( t_d2h );
         }
-        frame->nfilled[list] = nref;
+        if( b_sync )
+            frame->nfilled[list] = nref;
+        else
+            frame->pending[list] = nref;
     }
-    if( cudaStreamSynchronize( c->stream ) != cudaSuccess )
-        goto fail;
-    TIM_MARK( t_sync );
+    if( b_sync )
+    {
+        if( cudaStreamSynchronize( c->stream ) != cudaSuccess )
+            goto fail;
+        TIM_MARK( t_sync );
+        publish_candidates( c, frame, 0, frame->nfilled[0] );
+        publish_candidates( c, frame, 1, frame->nfilled[1] );
+    }
+    if( c->prof )
+    {
+        c->t_call += gpu_now_ms() - t_call0;
+        c->n_call++;
+    }
     c->nframes++;
 #undef TIM_MARK
     return 0;
@@ -474,21 +563,107 @@ extern "C" int x264_gpu_analyze( void *ctx, x264_gpu_frame_t *frame,
 fail:
     cudaStreamSynchronize( c->stream );
     c->disabled = 1;
+    c->pending_frame = NULL;
+    frame->nfilled[0] = frame->nfilled[1] = 0;
+    frame->pending[0] = frame->pending[1] = 0;
     return -1;
 }
 
-extern "C" const x264_gpu_cand_t *x264_gpu_frame_get( const x264_gpu_frame_t *f,
-                                                      int list, int ref, int mbx, int mby,
-                                                      int *count )
+extern "C" int x264_gpu_analyze( void *ctx, x264_gpu_frame_t *frame,
+                                 const uint8_t *cur, int cur_stride,
+                                 uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
+                                 uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
+                                 int range, int radius )
 {
-    /* Only references that were actually analysed in the most recent
-     * x264_gpu_analyze() call have valid candidates; everything else must
-     * fall back to the normal CPU search. */
-    if( !f || !count || list < 0 || list > 1 || ref < 0 || ref >= f->nfilled[list] )
+    return gpu_analyze_common( ctx, frame, cur, cur_stride,
+                               refs0, ref_ids0, stride0, nref0,
+                               refs1, ref_ids1, stride1, nref1,
+                               range, radius, 1 );
+}
+
+extern "C" int x264_gpu_analyze_async( void *ctx, x264_gpu_frame_t *frame,
+                                       const uint8_t *cur, int cur_stride,
+                                       uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
+                                       uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
+                                       int range, int radius )
+{
+    return gpu_analyze_common( ctx, frame, cur, cur_stride,
+                               refs0, ref_ids0, stride0, nref0,
+                               refs1, ref_ids1, stride1, nref1,
+                               range, radius, 0 );
+}
+
+/* Wait for an in-flight analysis and publish its results. */
+extern "C" int x264_gpu_finish( void *ctx )
+{
+    x264_gpu_ctx_t *c = (x264_gpu_ctx_t*)ctx;
+    if( !c || !c->pending_frame )
+        return 0;
+    std::lock_guard<std::mutex> guard( c->lock );
+    x264_gpu_frame_t *f = c->pending_frame;
+    double t0 = c->timing ? gpu_now_ms() : 0;
+    if( cudaStreamSynchronize( c->stream ) != cudaSuccess )
+    {
+        c->disabled = 1;
+        c->pending_frame = NULL;
+        f->pending[0] = f->pending[1] = 0;
+        return -1;
+    }
+    if( c->timing )
+    {
+        c->t_finish += gpu_now_ms() - t0;
+        c->n_finish++;
+    }
+    publish_candidates( c, f, 0, f->pending[0] );
+    publish_candidates( c, f, 1, f->pending[1] );
+    f->nfilled[0] = f->pending[0];
+    f->nfilled[1] = f->pending[1];
+    f->pending[0] = f->pending[1] = 0;
+    c->pending_frame = NULL;
+    return 0;
+}
+
+extern "C" int x264_gpu_is_pending( void *ctx, const x264_gpu_frame_t *frame )
+{
+    x264_gpu_ctx_t *c = (x264_gpu_ctx_t*)ctx;
+    return c && c->pending_frame && c->pending_frame == frame;
+}
+
+extern "C" int x264_gpu_pending_any( void *ctx )
+{
+    x264_gpu_ctx_t *c = (x264_gpu_ctx_t*)ctx;
+    return c && c->pending_frame != NULL;
+}
+
+extern "C" const x264_gpu_cand_t *x264_gpu_frame_get( const x264_gpu_frame_t *f,
+                                                      int list, const void *ref_plane, int64_t ref_id,
+                                                      int mbx, int mby, int *count )
+{
+    /* Only references published by the most recent analysis have valid
+     * candidates; everything else falls back to the normal CPU search.
+     * Slots are matched by identity so candidates stay usable when the
+     * analysis ran for a predicted reference set. */
+    if( !f || !count || list < 0 || list > 1 )
         return NULL;
     if( mbx < 0 || mbx >= f->mbw || mby < 0 || mby >= f->mbh )
         return NULL;
-    *count = f->ncand;
-    return (const x264_gpu_cand_t *)( f->cand[list][ref] +
-                                     ((size_t)mby * f->mbw + mbx) * GK );
+    for( int r = 0; r < f->nfilled[list]; r++ )
+        if( f->slot_ptr[list][r] == ref_plane && f->slot_id[list][r] == ref_id )
+        {
+            *count = f->ncand;
+            return (const x264_gpu_cand_t *)( f->cand[list][r] +
+                                             ((size_t)mby * f->mbw + mbx) * GK );
+        }
+    return NULL;
+}
+
+extern "C" int x264_gpu_frame_covers( const x264_gpu_frame_t *f,
+                                      int list, const void *ref_plane, int64_t ref_id )
+{
+    if( !f || list < 0 || list > 1 )
+        return 0;
+    for( int r = 0; r < f->nfilled[list]; r++ )
+        if( f->slot_ptr[list][r] == ref_plane && f->slot_id[list][r] == ref_id )
+            return 1;
+    return 0;
 }

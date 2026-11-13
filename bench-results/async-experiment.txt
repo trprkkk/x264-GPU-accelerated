@@ -1,0 +1,41 @@
+# Phase 3: asynchronous prefetch (overlap) measurements (2026-11-14)
+
+## What was built
+
+`gpu_me_prefetch()` (encoder.c) launches the CUDA analysis for the *next*
+frame at the end of the current encode, so the GPU works while the CPU does
+the NAL output and the next frame's prologue.  The next frame's reference
+lists are predicted from the DPB (`reference_build_list` picks from the same
+set, ordered by |i_frame distance| per direction).  Candidates are matched by
+reference identity (plane pointer + i_frame) and are only accepted when they
+cover the final lists; otherwise the regular synchronous analysis runs, so
+the bitstream is unchanged.  `X264_GPU_ASYNC=0` restores the synchronous
+path; `X264_GPU_PROF=1` prints call/waits.
+
+Two implementation findings that made it actually work:
+
+1. Pageable `cudaMemcpyAsync` (H2D *and* D2H) synchronises the stream, which
+   serialised the whole analysis onto the calling thread (`x264_gpu_analyze`
+   call: 1.86 ms even without a final sync).  All transfers now go through
+   pinned staging buffers (`cudaMallocHost`), and candidates are copied into
+   the frame after the stream sync (publish step).
+2. `i_poc` is only assigned while a frame is encoded, so the reference
+   prediction must use `i_frame` (assigned at input time).
+
+## Verification
+
+* Output identical to the previous binary: mode 0 `BEB55C36...`, mode 2
+  placebo 240 f `965066A7...`, mode 3 placebo 240 f `B3090B30...` all match
+  the recorded hashes; selftest 21/21 (including mode 4 determinism).
+* `X264_GPU_PROF=1`: prefetch finish wait 0.002 ms/frame -> the GPU work is
+  fully hidden by the overlap.
+* Wall-clock A/B (interleaved, 240 f, single thread, `X264_GPU_ASYNC=0/1`),
+  medians of 5: m2 esa -1.4 %, m2 tesa -1.3 %, m3 tesa -1.0 % (negative =
+  async faster).  A 720-frame run measured the same direction/order of
+  magnitude on a loaded machine; the end-to-end gain is ~1 % because the
+  staging copies (memcpy into pinned memory) and the pageable current-frame
+  upload remain on the CPU critical path.
+
+The earlier "no gain" results came from the pageable-copy serialisation:
+the analysis blocked almost as long as its own final sync would have, so
+there was nothing to overlap.

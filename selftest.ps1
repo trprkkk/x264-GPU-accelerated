@@ -1,4 +1,4 @@
-# Acceptance self-test for hybrid-x264-gpu.
+﻿# Acceptance self-test for hybrid-x264-gpu.
 # Verifies that:
 #   1) --gpu-me 0 output is bit-identical to the stock x264 baseline
 #   2) GPU modes run and exit cleanly
@@ -48,7 +48,7 @@ if( Test-Path $base )
 else { Write-Host "SKIP: x264-baseline.exe not found, cannot verify bit-exactness" -ForegroundColor Yellow }
 
 # 2) GPU modes run and exit cleanly
-foreach( $m in 1,2,3 )
+foreach( $m in 1,2,3,4 )
 {
     & $exe "--preset" "slow" "--gpu-me" $m @common $yuv "-o" "testdata\st_g$m.264" 2> $null
     if( $LASTEXITCODE -eq 0 ) { Write-Host "PASS: --gpu-me $m encode exited cleanly" -ForegroundColor Green }
@@ -76,7 +76,7 @@ else { Write-Host "FAIL: 10-bit fallback warning missing" -ForegroundColor Red; 
 
 # 4) determinism: repeated runs of the same GPU mode must be bit-identical
 $detCommon = @("--preset","slow","--crf","23","--threads","1","--frames","80","--input-res","1280x720","--fps","30")
-foreach( $m in 1,2,3 )
+foreach( $m in 1,2,3,4 )
 {
     & $exe "--gpu-me" $m @detCommon $yuv "-o" "testdata\st_d${m}a.264" 2> $null
     & $exe "--gpu-me" $m @detCommon $yuv "-o" "testdata\st_d${m}b.264" 2> $null
@@ -98,7 +98,7 @@ if( $ffprobe )
 {
     & $exe "--gpu-me" "0" @detCommon $yuv "-o" "testdata\st_ft0.264" 2> $null
     $types0 = (& $ffprobe "-v" "error" "-select_streams" "v" "-show_entries" "frame=pict_type" "-of" "csv=p=0" "testdata\st_ft0.264") -join ''
-    foreach( $m in 1,2,3 )
+    foreach( $m in 1,2,3,4 )
     {
         $types = (& $ffprobe "-v" "error" "-select_streams" "v" "-show_entries" "frame=pict_type" "-of" "csv=p=0" "testdata\st_d${m}a.264") -join ''
         if( $types -eq $types0 ) { Write-Host "PASS: --gpu-me $m frame types match mode 0" -ForegroundColor Green }
@@ -128,7 +128,37 @@ if( Test-Path $yuv1080 )
 }
 else { Write-Host "SKIP: test1080p.yuv not found, cannot verify 1080p GPU path" -ForegroundColor Yellow }
 
-Remove-Item testdata\st_*.264,testdata\st_10bit.log,testdata\st_gpu.log,testdata\st_1080.log -ErrorAction SilentlyContinue
+# 7) compatibility smoke: 2-pass stats, qpfile, zones, multi-threaded encode
+$smoke = @("--preset","medium","--frames","30","--input-res","1280x720","--fps","30")
+$compatFail = @()
+# 2-pass encode with a stats file
+& $exe "--pass" "1" "--stats" "testdata\st_stats.log" "--bitrate" "600" @smoke "--gpu-me" "2" $yuv "-o" "NUL" 2> $null
+$p1 = $LASTEXITCODE
+& $exe "--pass" "2" "--stats" "testdata\st_stats.log" "--bitrate" "600" @smoke "--gpu-me" "2" $yuv "-o" "testdata\st_2pass.264" 2> $null
+$p2 = $LASTEXITCODE
+if( $p1 -eq 0 -and $p2 -eq 0 ) { Write-Host "PASS: 2-pass encode with stats file" -ForegroundColor Green }
+else { Write-Host "FAIL: 2-pass encode ($p1/$p2)" -ForegroundColor Red; $fail = 1 }
+# qpfile: force an I frame at display index 25
+Set-Content -Path "testdata\st.qpfile" -Value "25 I"
+& $exe "--qpfile" "testdata\st.qpfile" @smoke "--gpu-me" "2" $yuv "-o" "testdata\st_qp.264" 2> $null
+if( $LASTEXITCODE -eq 0 -and $ffprobe )
+{
+    $types = @(& $ffprobe "-v" "error" "-select_streams" "v" "-show_entries" "frame=pict_type" "-of" "csv=p=0" "testdata\st_qp.264")
+    if( $types.Count -gt 25 -and $types[25] -eq "I" ) { Write-Host "PASS: qpfile forced an I frame at index 25" -ForegroundColor Green }
+    else { Write-Host "FAIL: qpfile frame type at index 25 is $($types[25])" -ForegroundColor Red; $fail = 1 }
+}
+elseif( $LASTEXITCODE -eq 0 ) { Write-Host "PASS: qpfile encode exited cleanly (no ffprobe to verify)" -ForegroundColor Green }
+else { Write-Host "FAIL: qpfile encode exit $LASTEXITCODE" -ForegroundColor Red; $fail = 1 }
+# zones
+& $exe "--zones" "10,20,b=1.5" @smoke "--gpu-me" "2" $yuv "-o" "testdata\st_zone.264" 2> $null
+if( $LASTEXITCODE -eq 0 ) { Write-Host "PASS: zones encode exited cleanly" -ForegroundColor Green }
+else { Write-Host "FAIL: zones encode exit $LASTEXITCODE" -ForegroundColor Red; $fail = 1 }
+# frame threads + sliced threads
+& $exe "--threads" "4" "--sliced-threads" @smoke "--gpu-me" "2" $yuv "-o" "testdata\st_t4s.264" 2> $null
+if( $LASTEXITCODE -eq 0 ) { Write-Host "PASS: --threads 4 --sliced-threads with GPU mode" -ForegroundColor Green }
+else { Write-Host "FAIL: threaded encode exit $LASTEXITCODE" -ForegroundColor Red; $fail = 1 }
+
+Remove-Item testdata\st_*.264,testdata\st_10bit.log,testdata\st_gpu.log,testdata\st_1080.log,testdata\st_stats.log,testdata\st_stats.log.mbtree,testdata\st.qpfile -ErrorAction SilentlyContinue
 
 if( $fail ) { Write-Host "SELFTEST FAILED" -ForegroundColor Red; exit 1 }
 Write-Host "ALL TESTS PASSED" -ForegroundColor Green

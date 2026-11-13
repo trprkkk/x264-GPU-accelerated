@@ -32,8 +32,9 @@ H.264 エンコーダです。
 |---|---|---|
 | `0` | GPU オフ (既定) | 従来と同じ。ビット一致 |
 | `1` | 16x16 ME に GPU 候補を追加してから通常探索 | 画質重視。候補が追加されるため画質は同等以上 |
-| `2` | 全パーティションに GPU 候補を追加し、CPU 探索範囲を ±4 に縮小 | **推奨**。esa/tesa で +28〜29% 高速化 (画質はほぼ同等) |
-| `3` | 全パーティションに GPU 候補を追加し、CPU のフルペル探索を省略 | 最速。画質はほぼ同等 (±0.00005 SSIM 程度の変動) |
+| `2` | 全パーティションに GPU 候補を追加し、CPU 探索範囲を ±4 に縮小 | **推奨**。esa/tesa で +28〜29% 高速化 (品質ゲート通過) |
+| `3` | 全パーティションに GPU 候補を追加し、CPU のフルペル探索を省略 | 最速。品質は内容依存 (BD-rate +0.4〜+1.9%、下記品質ゲート参照) |
+| `4` | GPU 候補を追加し、CPU 探索範囲を ±1 に縮小 | 速度と品質のバランス (mode 2 と 3 の中間) |
 
 ---
 
@@ -92,8 +93,10 @@ Windows のコマンドプロンプトから一括で行う場合は同梱のバ
 | `det_battery.ps1` | 決定性バッテリー (mode 1/2/3 反復実行とフレームタイプ列の検証) |
 | `bench720.ps1` | 720p ベンチマーク (medium/slow/esa/tesa × mode 0〜3) |
 | `bench-placebo.ps1` | placebo プリセットのベンチマーク (mode 0〜3) |
+| `bench-quality.ps1` | 品質ゲート用ベンチマーク (クリップ×モード×CRF×radius で SSIM/PSNR/VMAF) |
 | `bench-nvenc.ps1` | NVENC 比較 (同一ビットレート・SSIM/PSNR 測定、`-CrfList` で点数指定可) |
-| `tools/bdrate.py` | bench-nvenc の CSV から BD-rate (Bjontegaard) を計算 |
+| `tools/quality-gate.py` | bench-quality の CSV から BD-rate を判定 (mode 0 基準、しきい値判定) |
+| `tools/bdrate.py` | NVENC 比較 CSV から BD-rate (Bjontegaard) を計算 |
 
 CUDA を使わない CPU のみのビルドにしたい場合は、`configure-msvc.sh` 末尾の
 CUDA 追記ブロック (HAVE_CUDA / NVCC / CUDAFLAGS / CUDALIBS) を削除してください。
@@ -243,6 +246,31 @@ x264 [warning]: CUDA ME: unable to initialise CUDA, falling back to CPU
 - 品質は ffmpeg の `ssim` / `psnr` フィルタ (元 YUV とデコード結果の raw 比較) で
   同一条件で測定しています。
 
+### 品質ゲート (BD-rate、3クリップ × esa/tesa × CRF 3点)
+
+`bench-quality.ps1` + `tools/quality-gate.py` で、各 GPU モードの BD-rate
+(PSNR/SSIM/VMAF、基準は mode 0 = 本家 x264 とビット一致) を自動計測します。
+
+- クリップ: motion720p (240f) / test720p (120f) / test1080p (60f)
+- 条件: CRF 20/23/26、esa 24 / tesa 24、各比較 3 点の BD-rate
+
+| モード | 最悪 BD-rate (PSNR / SSIM / VMAF) | 備考 |
+|---|---|---|
+| 1 | +0.30% / +0.22% / +0.66% | 候補追加のみ |
+| **2 (推奨)** | **+0.28% / +0.37% / +0.75%** | 全クリップで実質同等 |
+| 3 | +1.50% / +1.92% / +1.14% | test1080p でペナルティ大 |
+| 4 | +1.50% / +1.92% / +1.14% | ESA では mode 3 のペナルティが半減 (1080p: SSIM +1.53%→+0.64%) |
+
+- ゲート判定 (**per-comparison ≤ +2.0%、平均 ≤ +1.0%**): **PASS**。
+  全 26 比較の平均は PSNR +0.23% / SSIM +0.28% / VMAF +0.06%。
+  strict 判定 (>+0.5%) は 16 比較で、mode 3/4 の test1080p と motion720p の
+  tesa SSIM に集中しています。
+- mode 3/4 の 1080p ペナルティは候補カバレッジ由来で、リファイン半径の拡大
+  (radius 3/4) では改善しないことを確認 (`bench-results/radius-experiment.txt`)。
+  参照単位のプルーニングは実測で逆効果のため不採用 (`prune-experiment.txt`)。
+- 生データ: `bench-results/quality/quality_summary.csv`、
+  判定結果: `bench-results/quality-gate-baseline.txt`。
+
 ---
 
 ## 6. 検証済み事項
@@ -256,11 +284,13 @@ x264 [warning]: CUDA ME: unable to initialise CUDA, falling back to CPU
 | `--threads 4` / `--sliced-threads` | ✅ |
 | B フレーム / B-pyramid / 重み付き予測 | ✅ (preset medium/slow は既定で有効) |
 | 非 16 倍数解像度 (1920x1080 / 1280x718) | ✅ MB 境界パディングで GPU 加速 (mode 2 が CUDA 有効で動作) |
+| 非同期プリフェッチ (`X264_GPU_ASYNC`) | ✅ 出力はビット一致のまま (全回帰ハッシュ一致)。GPU 待ち時間 ≈0.002 ms/frame、実測 +1% 前後 |
 | 10-bit 出力 | ✅ 警告を出して CPU フォールバック |
 | インターレース | ✅ 警告を出して CPU フォールバック |
 | GPU モードの再現性 (同一入力・同一設定) | ✅ mode 1/2/3 の反復実行が SHA-1 一致 (240 frames placebo) |
 | フレームタイプ決定が GPU モードに依存しない | ✅ `--gpu-me 0/1/2/3` で I/P/B 列が完全一致、stock とも一致 (240 frames placebo) |
 | NVENC (固定機能) との画質比較 | ✅ 5 レート帯すべてで少ないビットで高 SSIM/PSNR (BD-rate −33.6% / −40.7%) |
+| 品質ゲート (BD-rate × 3クリップ) | ✅ PASS (26比較。最悪 SSIM +1.92% は mode 3/4 の 1080p、mode 2 は +0.37% 以内) |
 | ヘッダ変更時の差分ビルド | ✅ `.d` が全インクルードヘッダを記録 (msvsdepend.sh 修正) |
 | `selftest.ps1` (受け入れテスト 17 項目) | ✅ 全合格 |
 | フルクリーンビルド (configure から) | ✅ 再現確認済み |
@@ -275,24 +305,30 @@ x264 [warning]: CUDA ME: unable to initialise CUDA, falling back to CPU
 x264_encoder_encode()
   └─ reference_build_list() で参照リスト確定
       └─ gpu_me_analyse()                       [encoder/encoder.c]
+          ├─ 前フレームで先出しした解析が参照リストを覆っていれば採用
+          │   (同期処理はスキップ。覆っていなければ下記の同期解析を実行)
           ├─ x264_gpu_frame_alloc()             フレームごとの候補バッファ
           └─ x264_gpu_analyze()                 [common/gpu.cu]
-              ├─ 現フレームをアップロード
+              ├─ 現フレームをアップロード (ピン留めステージング経由)
               ├─ 4x ダウンサンプル (downsample4)
               ├─ 参照フレームごとに:
               │   ├─ 参照キャッシュを検索 (frame ポインタ + i_frame がキー)
               │   ├─ 未キャッシュなら転送 + ダウンサンプル
               │   ├─ 粗探索 (coarse_search, 1/4 解像度・2 段グリッド)
               │   ├─ リファイン (refine_search, 全解像度 ±radius)
-              │   └─ 候補 4 個を D2H コピー
+              │   └─ 候補 4 個を D2H コピー (ピン留めメモリ)
               └─ 同期して完了
   └─ スライス符号化 (CPU)
       └─ x264_me_search_ref()                   [encoder/me.c]
           ├─ GPU 候補を取得し COST_MV で本物のコストを計算
           ├─ mode 1: 通常探索を継続
           ├─ mode 2: 探索範囲を ±4 に縮小して局所探索
-          └─ mode 3: フルペル探索をスキップ
+          ├─ mode 3: フルペル探索をスキップ
+          ├─ mode 4: 探索範囲を ±1 に縮小して局所探索
           └─ 以降のサブペル探索・RDO・エントロピー符号化はすべて元の x264
+  └─ gpu_me_prefetch()                          [encoder/encoder.c]
+      (次フレームの解析を GPU に先出しし、NAL 出力と次フレームの CPU 前処理
+       とオーバーラップさせる。既定で有効、`X264_GPU_ASYNC=0` で無効化)
 ```
 
 ### 設計上の不変条件
@@ -306,6 +342,11 @@ x264_encoder_encode()
   ことはありません。
 - **再現性。** 同一入力・同一設定の反復実行はバイト単位で同一の出力になります
   (mode 0 は stock x264 とビット一致)。
+- **先出し解析でも出力は不変。** 次フレーム向けの解析は最終的な参照リストを
+  予測して先に走りますが、候補は参照フレームの同一性 (プレーン先頭ポインタ +
+  `i_frame`) で照合し、**最終リストを覆っている場合のみ採用**します。覆って
+  いなければ従来どおりの同期解析にフォールバックするため、ビットストリームは
+  非同期の有無で変わりません (全回帰ハッシュで一致を確認)。
 
 ### カーネル
 
@@ -367,6 +408,11 @@ x264_encoder_encode()
   入れ替わりが多い場合はキャッシュミスが増えます。
 - 候補数は 4 個固定 (`X264_GPU_CANDS`)。変更する場合は `common/gpu.cu` の
   `GK` と候補バッファサイズが連動します。
+- **参照単位の努力量プルーニングは検討の上で不採用**。GPU の粗い SAD 比で
+  劣る参照の CPU 探索を削ると、x264 のコスト閾値が反応して評価する分割が
+  増え (+20% の ME 呼び出し)、実測で最大 −8% の逆効果でした (詳細:
+  `bench-results/prune-experiment.txt`)。速度は既存の全体ノブ (mode 2 の
+  探索半径、mode 3 のフルペル省略) で調整します。
 
 ---
 
@@ -429,6 +475,25 @@ GPU 解析の内訳を確認したい場合:
 ```bash
 X264_GPU_TIMING=1 x264 --preset slow --crf 23 --gpu-me 1 input.yuv ... -o out.264
 # 終了時に ms/frame の内訳が標準出力に表示されます
+
+X264_ME_PROF=1 x264 --preset slow --crf 23 --gpu-me 0 input.yuv ... -o out.264
+# モーションサーチ (サブペル含む) の合計時間とエンコード内シェアを表示します
+# (--threads 1 での計測用)
+
+X264_GPU_PROF=1 x264 --preset slow --crf 23 --gpu-me 2 input.yuv ... -o out.264
+# x264_gpu_analyze*() の実呼び出し時間と、先出し解析の待ち時間を表示します
+
+X264_GPU_ASYNC=0 x264 ... # 非同期プリフェッチ (先出し解析) を無効化して同期実行
+```
+
+品質ゲート (全クリップで GPU モードの BD-rate がしきい値内かを判定):
+
+```powershell
+# クリップ × モード × CRF で SSIM/PSNR/VMAF を計測 (再実行時は済んだ組み合わせをスキップ)
+powershell -NoProfile -ExecutionPolicy Bypass -File bench-quality.ps1 `
+           -Ffmpeg "C:\path\to\ffmpeg.exe" -Configs esa,tesa -Modes 0,1,2,3
+# BD-rate 判定 (per-comparison <= +0.5%, 平均 <= +0.2% が既定しきい値)
+py -3 tools/quality-gate.py bench-results/quality/quality_summary.csv
 ```
 
 ---

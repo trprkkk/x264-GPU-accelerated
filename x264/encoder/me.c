@@ -182,7 +182,7 @@ do\
 #define SPEL(mv) ((mv)*4)      /* ... and the reverse. */
 #define SPELx2(mv) (SPEL(mv)&0xFFFCFFFC) /* for two packed MVs */
 
-void x264_me_search_ref( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], int i_mvc, int *p_halfpel_thresh )
+static void me_search_ref_internal( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], int i_mvc, int *p_halfpel_thresh )
 {
     const int bw = x264_pixel_size[m->i_pixel].w;
     const int bh = x264_pixel_size[m->i_pixel].h;
@@ -337,8 +337,10 @@ void x264_me_search_ref( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], int i_mvc, 
         (i_pixel == PIXEL_16x16 || i_gpu_mode >= 2) )
     {
         int ncand = 0;
+        const x264_frame_t *ref = h->fref[m->i_list][m->i_ref];
         const x264_gpu_cand_t *cand = x264_gpu_frame_get(
-            (const x264_gpu_frame_t*)h->fenc->gpu_me, m->i_list, m->i_ref,
+            (const x264_gpu_frame_t*)h->fenc->gpu_me, m->i_list,
+            ref->plane[0], ref->i_frame,
             h->mb.i_mb_x, h->mb.i_mb_y, &ncand );
         if( cand )
             for( int i = 0; i < ncand; i++ )
@@ -360,10 +362,10 @@ void x264_me_search_ref( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], int i_mvc, 
             }
         if( b_gpu_fpel )
         {
-            if( i_gpu_mode >= 3 )
+            if( i_gpu_mode == 3 )
                 b_gpu_fpel = 3;
             else if( i_gpu_mode >= 2 )
-                i_me_range = X264_MIN( i_me_range, 4 );
+                i_me_range = X264_MIN( i_me_range, i_gpu_mode >= 4 ? 1 : 4 );
         }
     }
 #endif
@@ -849,6 +851,70 @@ void x264_me_search_ref( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], int i_mvc, 
     }
 }
 #undef COST_MV
+
+/* --- optional motion-search profiler -------------------------------------
+ * X264_ME_PROF=1 makes the encoder print the total time spent in
+ * x264_me_search_ref() (full-pel search plus sub-pel refinement) at close.
+ * The share of the encode span (first to last call) sizes how much headroom
+ * a GPU-driven search pruning can recover.  Intended for --threads 1 runs. */
+#if !defined(_WIN32)
+#include <time.h>
+#endif
+
+#if defined(_WIN32)
+static double x264_me_prof_now( void )
+{
+    LARGE_INTEGER t, f;
+    QueryPerformanceFrequency( &f );
+    QueryPerformanceCounter( &t );
+    return (double)t.QuadPart / (double)f.QuadPart;
+}
+#else
+static double x264_me_prof_now( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+#endif
+
+static int64_t x264_me_prof_calls;
+static double  x264_me_prof_total;
+static double  x264_me_prof_first;
+static double  x264_me_prof_last;
+static int     x264_me_prof_enabled = -1;
+
+void x264_me_prof_print( void )
+{
+    if( x264_me_prof_enabled != 1 || !x264_me_prof_calls )
+        return;
+    double span = x264_me_prof_last - x264_me_prof_first;
+    printf( "x264 ME profile: %lld calls, %.3f s in motion search",
+            (long long)x264_me_prof_calls, x264_me_prof_total );
+    if( span > 0.0 )
+        printf( " over %.3f s (%.1f%% of the encode span)",
+                span, 100.0 * x264_me_prof_total / span );
+    printf( ", %.2f us/call\n", 1e6 * x264_me_prof_total / (double)x264_me_prof_calls );
+}
+
+void x264_me_search_ref( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], int i_mvc, int *p_halfpel_thresh )
+{
+    if( x264_me_prof_enabled < 0 )
+        x264_me_prof_enabled = getenv( "X264_ME_PROF" ) != NULL;
+    if( !x264_me_prof_enabled )
+    {
+        me_search_ref_internal( h, m, mvc, i_mvc, p_halfpel_thresh );
+        return;
+    }
+    double t0 = x264_me_prof_now();
+    me_search_ref_internal( h, m, mvc, i_mvc, p_halfpel_thresh );
+    double t1 = x264_me_prof_now();
+    if( !x264_me_prof_calls )
+        x264_me_prof_first = t0;
+    x264_me_prof_last = t1;
+    x264_me_prof_total += t1 - t0;
+    x264_me_prof_calls++;
+}
 
 void x264_me_refine_qpel( x264_t *h, x264_me_t *m )
 {

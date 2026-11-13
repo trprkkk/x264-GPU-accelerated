@@ -1,0 +1,38 @@
+# Phase 2 experiment: GPU refine radius vs quality (2026-11-14)
+
+## Motivation
+
+The quality gate (bench-quality.ps1 + tools/quality-gate.py) showed mode 3
+(no CPU full-pel search at all) at BD-rate +1.1..+1.9 % on test1080p.
+Hypothesis: the GPU candidates are too imprecise, so a larger refinement
+radius (`--gpu-me-radius`, default 2) should close the gap.
+
+## Measured
+
+bench-quality.ps1 -Configs esa,tesa -Modes 3 -CrfList 20,23,26 -RadiusList 2,3,4
+
+PSNR BD-rate of mode 3 vs mode 0 per clip/config:
+
+| clip / config      | r2 (default) | r3     | r4     |
+|--------------------|-------------:|-------:|-------:|
+| test1080p / esa24  |      +1.12 % | +1.17 %| +1.21 %|
+| test1080p / tesa24 |      +1.50 % | +1.50 %| +1.32 %|
+| motion720p / esa24 |      -0.04 % | +0.25 %| +0.21 %|
+
+Isolated radius effect vs r2 (PSNR BD-rate): -0.18 % .. +0.29 %, i.e. noise
+level and sometimes negative.
+
+Speed drops as expected: the refine kernel scales with (2r+1)^2, so r3 is
+about 2x the refine time (e.g. test1080p esa c23 mode 3: 9.31 fps at r2 ->
+6.30 fps at r3).
+
+## Conclusion
+
+The mode-3 quality gap is **not** the precision of the refinement but the
+*coverage* of the candidate set (coarse search pattern / range).  A larger
+radius does not help and costs speed, so radius 2 stays the default.
+
+The coverage issue is addressed instead by **mode 4** (GPU candidates plus a
+cheap ±1 CPU search), which re-adds local correction on top of the
+candidates at a small fraction of the mode-2 cost (see quality_m4_out.txt /
+the quality CSV).
