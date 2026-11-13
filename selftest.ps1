@@ -65,7 +65,7 @@ foreach( $m in 1,2,3,4 )
 # 2b) CUDA analysis is actually engaged (informational: CPU fallback is valid
 #     on machines without a compatible GPU/driver)
 & $exe "--preset" "slow" "--gpu-me" "2" @common $yuv "-o" "NUL" 2> "testdata\st_gpu.log"
-if( (Get-Content "testdata\st_gpu.log" -Raw) -match "GPU ME: " ) { Write-Host "PASS: CUDA analysis active" -ForegroundColor Green }
+if( (Get-Content "testdata\st_gpu.log" -Raw) -match "GPU ME: " ) { Write-Host "PASS: GPU analysis active" -ForegroundColor Green }
 else { Write-Host "WARN: CUDA not active (CPU fallback)" -ForegroundColor Yellow }
 
 # 3) unsupported configuration (10-bit) falls back with a warning

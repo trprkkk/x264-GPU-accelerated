@@ -1,10 +1,10 @@
 # hybrid-x264-gpu
 
 x264 (0.165.x, commit `0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee`) をベースに、
-**CUDA による整数精度動き探索 (ME) の候補生成**を追加した CPU/GPU ハイブリッド
+**CUDA / OpenCL による整数精度動き探索 (ME) の候補生成**を追加した CPU/GPU ハイブリッド
 H.264 エンコーダです。
 
-- GPU は NVENC のような固定機能ではなく、汎用 CUDA コアで動き探索の候補を計算します。
+- GPU は NVENC のような固定機能ではなく、汎用 CUDA / OpenCL コアで動き探索の候補を計算します。
 - **最終的な符号化判断はすべて CPU 側の x264 コードが行います。** GPU が返すのは
   マクロブロックごとの整数精度 MV 候補 (最大 4 個/参照/リスト) のみで、x264 本体が
   本物のコスト関数 (SATD + λ·MV コスト、RDO) で評価し直します。
@@ -42,7 +42,7 @@ H.264 エンコーダです。
 
 - Windows x64
 - Visual Studio (C++ ツールセット。動作確認: VS 18 Community / cl 19.51)
-- CUDA Toolkit 13.3 (`nvcc` と `cudart_static.lib`) — 動作確認: 13.3.73
+- CUDA Toolkit 13.3 (`nvcc`、`cudart_static.lib`、および OpenCL バックエンド用の CL ヘッダ / `OpenCL.lib`) — 動作確認: 13.3.73
 - NASM 2.16.03 (`toolchain/nasm-2.16.03` に配置済み。別バージョンでも可)
 - Git Bash + `mingw32-make` (MSYS2/MinGW の make でも可)
 - NVIDIA GPU (Compute Capability 7.5 でビルド確認: RTX 2060 SUPER)
@@ -65,7 +65,7 @@ MB 境界までパディングされて解析されるため、1920x1080 のよ�
 # 1) 環境変数 (CUDA の場所。configure-msvc.sh / make-msvc.sh の既定値と同じ)
 export CUDA_ROOT="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3"
 
-# 2) configure (build-msvc/ を作成し config.mak / config.h に CUDA 設定を追記)
+# 2) configure (build-msvc/ を作成し config.mak / config.h に GPU 設定を追記)
 cd hybrid-x264-gpu
 ./configure-msvc.sh
 
@@ -79,8 +79,10 @@ cd hybrid-x264-gpu
 > ビット深度定義 (`-DBIT_DEPTH`) なしでスキャンが中断する問題の両方に対応済みで、
 > ヘッダ変更時の差分ビルドが正しく再コンパイルされます。
 >
-> CUDA カーネルのターゲット GPU は環境変数 `CUDA_ARCH` で指定できます
+> CUDA バックエンドのターゲット GPU は環境変数 `CUDA_ARCH` で指定できます
 > (既定 `sm_75` = Turing。Ampere なら `sm_86` など。`configure-msvc.sh` を参照)。
+> OpenCL バックエンドは CL ヘッダと `OpenCL.lib` (CUDA Toolkit 同梱) を使って
+> ビルドされ、実行時は GPU ドライバが提供する OpenCL 実装 (OpenCL.dll) をロードします。
 
 Windows のコマンドプロンプトから一括で行う場合は同梱のバッチを使用します
 (内部で `vcvars64.bat` を呼び、Git Bash 経由で make を実行します)。
@@ -99,9 +101,10 @@ Windows のコマンドプロンプトから一括で行う場合は同梱のバ
 | `tools/quality-gate.py` | bench-quality の CSV から BD-rate を判定 (mode 0 基準、しきい値判定) |
 | `tools/bdrate.py` | NVENC 比較 CSV から BD-rate (Bjontegaard) を計算 |
 
-CUDA を使わない CPU のみのビルドにしたい場合は、`configure-msvc.sh` 末尾の
-CUDA 追記ブロック (HAVE_CUDA / NVCC / CUDAFLAGS / CUDALIBS) を削除してください。
-`x264/common/gpu.cu` はリンクされず、`--gpu-me` は無効になります。
+GPU (CUDA / OpenCL) を使わない CPU のみのビルドにしたい場合は、
+`configure-msvc.sh` 末尾の GPU 追記ブロック (HAVE_CUDA / NVCC / CUDAFLAGS /
+CUDALIBS / OPENCL_INC / OPENCL_LIB) を削除してください。
+`x264/common/gpu*.c*` はリンクされず、`--gpu-me` は無効になります。
 
 ---
 
@@ -163,6 +166,7 @@ x264 [warning]: GPU ME: no usable GPU backend, falling back to CPU
 | GPU | NVIDIA GeForce RTX 2060 SUPER 8GB (sm_75) |
 | ドライバ | 32.0.15.9174 |
 | CUDA | 13.3.73 |
+| OpenCL | NVIDIA OpenCL 3.0 (同 GPU。バックエンド比較用) |
 | コンパイラ | MSVC 19.51 (VS 18 Community) |
 | x264 | 0.165.x (`0480cb05fa188d`) + 本フォーク |
 
@@ -352,6 +356,21 @@ x264_encoder_encode()
   いなければ従来どおりの同期解析にフォールバックするため、ビットストリームは
   非同期の有無で変わりません (全回帰ハッシュで一致を確認)。
 
+### バックエンド (CUDA / OpenCL)
+
+`common/gpu.c` が公開 API のディスパッチャで、`common/gpu.cu` (CUDA) と
+`common/gpu_cl.c` (OpenCL) が同一アルゴリズムを実装します。
+
+- 選択: `--gpu-me-backend 0|1|2` (既定 0 = 自動で CUDA → OpenCL の順に試行)。
+  使用中のバックエンドとデバイスは起動ログ (`GPU ME: <backend> / <device>`) に表示。
+- **両バックエンドの出力はビット単位で一致します。** カーネルは走査順・比較
+  演算子まで同一で、候補は参照の同一性 (プレーン先頭ポインタ + `i_frame`) で
+  照合されます。バックエンド名は SEI のパラメータ文字列に含めないため、
+  ストリームをそのままハッシュ比較できます (selftest で自動検証)。
+- 転送は両バックエンドともピン留めステージングを使い、非同期プリフェッチが
+  そのまま動作します。OpenCL は同一出力のまま CUDA よりわずかに低速です
+  (実測: esa 24 mode 2・240 フレームで CUDA 8.82 s / OpenCL 9.17 s)。
+
 ### カーネル
 
 | カーネル | 内容 |
@@ -396,7 +415,7 @@ x264_encoder_encode()
 | `encoder/slicetype.c` | ルックアヘッドの低解像度 ME に `i_list = -1` を設定し、GPU 候補の注入対象外にする |
 | `Makefile` | `common/gpu.o` のビルド (nvcc) と `cudart_static.lib` のリンク |
 | `x264/tools/msvsdepend.sh` | Windows 差分ビルドのヘッダ依存生成を修正 (日本語ロケールの `/showIncludes` 対応、ビット深度定義の付与、失敗時のビルド中断) |
-| `configure-msvc.sh` / `make-msvc.sh` | CUDA 設定の追記とライブラリパス設定 |
+| `configure-msvc.sh` / `make-msvc.sh` | GPU 設定 (CUDA / OpenCL) の追記とライブラリパス設定 |
 | `dev/gpu_me_bench.cu` | 開発用の単体 CUDA ベンチマーク (エンコーダ本体にはリンクされません) |
 | `bench720.ps1` / `bench-results/` | ベンチマーク実行スクリプトと全測定ログ (NVENC 比較含む) |
 
@@ -407,9 +426,13 @@ x264_encoder_encode()
 - **8-bit のみ**。10-bit / 12-bit エンコードでは GPU は使われません (CPU フォールバック)。
 - **インターレース非対応** (CPU フォールバック)。
 - **x265/HEVC 版は未収録**。本フォークは x264 (H.264) のみです。
-- 解析はフレーム先頭で**同期実行**のため、medium/slow のような CPU 探索が軽い
-  プリセットでは相対的にオーバーヘッドが目立ちます。行単位の非同期パイプライン化
-  (GPU 解析と CPU 符号化のオーバーラップ) は今後の課題です。
+- **OpenCL バックエンドは NVIDIA 実機のみ検証済み**。カーネルはポータブルな
+  OpenCL C 1.2 の範囲のみ使用していますが、AMD/Intel 実機での検証は未実施です。
+  OpenCL も同一出力のまま CUDA よりわずかに低速 (~4%)。
+- 解析はフレーム先頭で**同期実行**でしたが、先出し解析 (`gpu_me_prefetch`) により
+  GPU 待ちはほぼ隠蔽済み (0.002 ms/frame)。medium/slow のような CPU 探索が軽い
+  プリセットでは、依然として GPU 解析の相対コストが大きくなります
+  (mode 0 が最速)。
 - 参照キャッシュは 8 面固定。`--gpu-me-refs` を大きくしすぎた場合や、参照の
   入れ替わりが多い場合はキャッシュミスが増えます。
 - 候補数は 4 個固定 (`X264_GPU_CANDS`)。変更する場合は `common/gpu.cu` の
@@ -455,6 +478,17 @@ py -3 tools/bdrate.py bench-results/nvenc-comparison/repro_summary.csv
 > `tools/bdrate.py` は acceleratedencode_GPU (MIT) の同種ツールの手法を参考に、
 > 本プロジェクト用に再実装したものです。品質カーブの重複範囲外は除外し、
 > 重複率を併記します。
+
+OpenCL バックエンドの検証 (CUDA とハッシュ一致することを確認できます):
+
+```powershell
+# CUDA (または自動選択) と OpenCL で同一設定をエンコードして比較
+build-msvc\x264.exe --preset placebo --crf 23 --threads 1 --gpu-me 2 `
+    testdata\motion720p.yuv --input-res 1280x720 --fps 30 -o a.264
+build-msvc\x264.exe --preset placebo --crf 23 --threads 1 --gpu-me 2 --gpu-me-backend 2 `
+    testdata\motion720p.yuv --input-res 1280x720 --fps 30 -o b.264
+Get-FileHash a.264, b.264 -Algorithm SHA1   # 同じハッシュになる
+```
 
 受け入れテスト (ビット一致・全 GPU モードの動作・デコード・フォールバック・決定性):
 
