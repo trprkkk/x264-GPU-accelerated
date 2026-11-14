@@ -170,7 +170,25 @@ if( (Get-Content "testdata\st_ocl_b.log" -Raw) -match "GPU ME: opencl" )
 }
 else { Write-Host "SKIP: OpenCL backend not available" -ForegroundColor Yellow }
 
-Remove-Item testdata\st_*.264,testdata\st_10bit.log,testdata\st_gpu.log,testdata\st_1080.log,testdata\st_stats.log,testdata\st_stats.log.mbtree,testdata\st.qpfile,testdata\st_ocl_a.log,testdata\st_ocl_b.log -ErrorAction SilentlyContinue
+# 9) a failing backend switches to the other one with bit-identical output
+$env:X264_GPU_SIMULATE_FAIL = "cuda"
+& $exe "--preset" "slow" "--gpu-me" "2" @common $yuv "-o" "testdata\st_fb.264" 2> "testdata\st_fb.log"
+$fbLog = Get-Content "testdata\st_fb.log" -Raw
+Remove-Item Env:\X264_GPU_SIMULATE_FAIL
+if( $fbLog -match "GPU ME: cuda" )
+{
+    if( $fbLog -match "GPU ME: switched to the opencl backend after an analysis failure" )
+    {
+        $hf = (Get-FileHash "testdata\st_fb.264"  -Algorithm SHA1).Hash
+        $hc = (Get-FileHash "testdata\st_ocl_a.264" -Algorithm SHA1).Hash
+        if( $hf -eq $hc ) { Write-Host "PASS: CUDA failure falls back to OpenCL (bit-identical)" -ForegroundColor Green }
+        else { Write-Host "FAIL: fallback output differs ($hf vs $hc)" -ForegroundColor Red; $fail = 1 }
+    }
+    else { Write-Host "FAIL: CUDA failure did not switch to the OpenCL backend" -ForegroundColor Red; $fail = 1 }
+}
+else { Write-Host "SKIP: CUDA backend is not the initial backend, cannot verify fallback" -ForegroundColor Yellow }
+
+Remove-Item testdata\st_*.264,testdata\st_10bit.log,testdata\st_gpu.log,testdata\st_1080.log,testdata\st_stats.log,testdata\st_stats.log.mbtree,testdata\st.qpfile,testdata\st_ocl_a.log,testdata\st_ocl_b.log,testdata\st_fb.log -ErrorAction SilentlyContinue
 
 if( $fail ) { Write-Host "SELFTEST FAILED" -ForegroundColor Red; exit 1 }
 Write-Host "ALL TESTS PASSED" -ForegroundColor Green

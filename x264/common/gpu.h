@@ -46,7 +46,8 @@ typedef struct
 
 typedef struct x264_gpu_backend_t
 {
-    const char *id;      /* "cuda" / "opencl" */
+    int id;              /* X264_GPU_BACKEND_* */
+    const char *name_id; /* "cuda" / "opencl" */
     int      (*available)( void );
     void *   (*create)( int width, int height, int max_refs, int device );
     void     (*destroy)( void *ctx );
@@ -81,6 +82,10 @@ extern const x264_gpu_backend_t x264_gpu_backend_cl;
  * Returns NULL when the selected backend is unavailable or init fails. */
 void *x264_gpu_create( int width, int height, int max_refs, int device, int backend );
 void  x264_gpu_destroy( void *ctx );
+/* After an analysis failure, try to continue on the other backend (retires
+ * the failing backend; at most one switch).  Returns 0 on success.  The
+ * caller must have released frames it still holds before switching. */
+int   x264_gpu_fallback( void *ctx );
 /* Human-readable name of the active backend/device ("" when none). */
 const char *x264_gpu_name( void *ctx );
 /* Backend id of a completed create() (for logging). */

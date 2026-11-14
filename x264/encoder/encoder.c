@@ -2470,7 +2470,60 @@ static int gpu_refs_covered( x264_t *h, int list, int nref )
     return 1;
 }
 
-/* Run the CUDA candidate generator for the current frame after the reference
+/* Release the candidate buffers the encoder still holds so they can be
+ * rebuilt on a different backend after a failure. */
+static void gpu_me_release_frames( x264_t *h )
+{
+    if( h->fenc && h->fenc->gpu_me )
+    {
+        x264_gpu_frame_free( (x264_gpu_frame_t*)h->fenc->gpu_me );
+        h->fenc->gpu_me = NULL;
+    }
+    if( h->frames.current[0] && h->frames.current[0]->gpu_me )
+    {
+        x264_gpu_frame_free( (x264_gpu_frame_t*)h->frames.current[0]->gpu_me );
+        h->frames.current[0]->gpu_me = NULL;
+    }
+}
+
+/* Synchronous analysis for the current frame.  Returns 0 on success, -1 on
+ * analysis failure and -2 when the candidate buffer cannot be allocated. */
+static int gpu_me_analyse_sync( x264_t *h, int nref0, int nref1 )
+{
+    if( !h->fenc->gpu_me )
+        h->fenc->gpu_me = x264_gpu_frame_alloc( h->gpu_ctx, h->mb.i_mb_width, h->mb.i_mb_height,
+                                                X264_GPU_MAX_REFS, X264_GPU_MAX_REFS );
+    if( !h->fenc->gpu_me )
+        return -2;
+
+    uint8_t *refs0[X264_GPU_MAX_REFS];
+    uint8_t *refs1[X264_GPU_MAX_REFS];
+    int64_t ids0[X264_GPU_MAX_REFS];
+    int64_t ids1[X264_GPU_MAX_REFS];
+    int strides0[X264_GPU_MAX_REFS];
+    int strides1[X264_GPU_MAX_REFS];
+    for( int i = 0; i < nref0; i++ )
+    {
+        refs0[i] = (uint8_t*)h->fref[0][i]->plane[0];
+        ids0[i] = h->fref[0][i]->i_frame;
+        strides0[i] = h->fref[0][i]->i_stride[0];
+    }
+    for( int i = 0; i < nref1; i++ )
+    {
+        refs1[i] = (uint8_t*)h->fref[1][i]->plane[0];
+        ids1[i] = h->fref[1][i]->i_frame;
+        strides1[i] = h->fref[1][i]->i_stride[0];
+    }
+
+    return x264_gpu_analyze( h->gpu_ctx, (x264_gpu_frame_t*)h->fenc->gpu_me,
+                             (const uint8_t*)h->fenc->plane[0], h->fenc->i_stride[0],
+                             refs0, ids0, strides0, nref0,
+                             refs1, ids1, strides1, nref1,
+                             h->param.analyse.i_gpu_me_range,
+                             h->param.analyse.i_gpu_me_radius );
+}
+
+/* Run the GPU candidate generator for the current frame after the reference
  * lists have been finalised.  The result is only a list of integer-pel
  * candidates; me.c still evaluates every one of them with the real x264 cost
  * function, so all coding decisions remain on the CPU. */
@@ -2481,16 +2534,6 @@ static void gpu_me_analyse( x264_t *h )
         return;
     if( !h->fenc->plane[0] || !h->mb.i_mb_width || !h->mb.i_mb_height )
         return;
-
-    if( !h->fenc->gpu_me )
-        h->fenc->gpu_me = x264_gpu_frame_alloc( h->gpu_ctx, h->mb.i_mb_width, h->mb.i_mb_height,
-                                                X264_GPU_MAX_REFS, X264_GPU_MAX_REFS );
-    if( !h->fenc->gpu_me )
-    {
-        x264_log( h, X264_LOG_WARNING, "GPU ME: candidate buffer allocation failed, disabling GPU ME\n" );
-        h->param.analyse.i_gpu_me = 0;
-        return;
-    }
 
     int maxrefs = h->param.analyse.i_gpu_me_refs;
     int nref0 = h->i_ref[0];
@@ -2514,35 +2557,45 @@ static void gpu_me_analyse( x264_t *h )
     if( !nref0 && !nref1 )
         return;
 
-    uint8_t *refs0[X264_GPU_MAX_REFS];
-    uint8_t *refs1[X264_GPU_MAX_REFS];
-    int64_t ids0[X264_GPU_MAX_REFS];
-    int64_t ids1[X264_GPU_MAX_REFS];
-    int strides0[X264_GPU_MAX_REFS];
-    int strides1[X264_GPU_MAX_REFS];
-    for( int i = 0; i < nref0; i++ )
+    if( gpu_me_analyse_sync( h, nref0, nref1 ) )
     {
-        refs0[i] = (uint8_t*)h->fref[0][i]->plane[0];
-        ids0[i] = h->fref[0][i]->i_frame;
-        strides0[i] = h->fref[0][i]->i_stride[0];
+        /* Analysis failure: release the frames that still hold buffers of the
+         * failing backend, then retry once.  The retry runs on the other
+         * backend after a switch, or on the active one when there is nothing
+         * left to switch to (the failure may have come from a stale frame
+         * allocated before an earlier switch). */
+        gpu_me_release_frames( h );
+        int switched = !x264_gpu_fallback( h->gpu_ctx );
+        if( gpu_me_analyse_sync( h, nref0, nref1 ) )
+        {
+            x264_log( h, X264_LOG_WARNING, "GPU ME: analysis failed, disabling GPU ME\n" );
+            h->param.analyse.i_gpu_me = 0;
+        }
+        else if( switched )
+            x264_log( h, X264_LOG_WARNING,
+                      "GPU ME: switched to the %s backend after an analysis failure\n",
+                      x264_gpu_backend_id( h->gpu_ctx ) );
     }
-    for( int i = 0; i < nref1; i++ )
-    {
-        refs1[i] = (uint8_t*)h->fref[1][i]->plane[0];
-        ids1[i] = h->fref[1][i]->i_frame;
-        strides1[i] = h->fref[1][i]->i_stride[0];
-    }
+}
 
-    if( x264_gpu_analyze( h->gpu_ctx, (x264_gpu_frame_t*)h->fenc->gpu_me,
-                          (const uint8_t*)h->fenc->plane[0], h->fenc->i_stride[0],
-                          refs0, ids0, strides0, nref0,
-                          refs1, ids1, strides1, nref1,
-                          h->param.analyse.i_gpu_me_range,
-                          h->param.analyse.i_gpu_me_radius ) < 0 )
-    {
-        x264_log( h, X264_LOG_WARNING, "GPU ME: analysis failed, disabling GPU ME\n" );
-        h->param.analyse.i_gpu_me = 0;
-    }
+/* Allocate the next frame's candidate buffer on the active backend and start
+ * its analysis.  Returns 0 when the analysis is in flight. */
+static int gpu_me_prefetch_launch( x264_t *h, x264_frame_t *next,
+                                   uint8_t *const refs0[], const int64_t ids0[], const int strides0[], int n0,
+                                   uint8_t *const refs1[], const int64_t ids1[], const int strides1[], int n1 )
+{
+    if( !next->gpu_me )
+        next->gpu_me = x264_gpu_frame_alloc( h->gpu_ctx, h->mb.i_mb_width, h->mb.i_mb_height,
+                                             X264_GPU_MAX_REFS, X264_GPU_MAX_REFS );
+    if( !next->gpu_me )
+        return -1;
+
+    return x264_gpu_analyze_async( h->gpu_ctx, (x264_gpu_frame_t*)next->gpu_me,
+                                   (const uint8_t*)next->plane[0], next->i_stride[0],
+                                   refs0, ids0, strides0, n0,
+                                   refs1, ids1, strides1, n1,
+                                   h->param.analyse.i_gpu_me_range,
+                                   h->param.analyse.i_gpu_me_radius );
 }
 
 /* Launch the CUDA analysis for the next frame ahead of time so it overlaps
@@ -2651,21 +2704,25 @@ static void gpu_me_prefetch( x264_t *h )
         strides1[i] = list1[i]->i_stride[0];
     }
 
-    if( !next->gpu_me )
-        next->gpu_me = x264_gpu_frame_alloc( h->gpu_ctx, h->mb.i_mb_width, h->mb.i_mb_height,
-                                             X264_GPU_MAX_REFS, X264_GPU_MAX_REFS );
-    if( !next->gpu_me )
-        return;
-
-    if( x264_gpu_analyze_async( h->gpu_ctx, (x264_gpu_frame_t*)next->gpu_me,
-                                (const uint8_t*)next->plane[0], next->i_stride[0],
-                                refs0, ids0, strides0, n0,
-                                refs1, ids1, strides1, n1,
-                                h->param.analyse.i_gpu_me_range,
-                                h->param.analyse.i_gpu_me_radius ) < 0 )
+    if( gpu_me_prefetch_launch( h, next, refs0, ids0, strides0, n0, refs1, ids1, strides1, n1 ) )
     {
-        x264_log( h, X264_LOG_WARNING, "GPU ME: analysis failed, disabling GPU ME\n" );
-        h->param.analyse.i_gpu_me = 0;
+        /* The prefetched frame holds buffers of the failing backend; release
+         * the frames the encoder still keeps, then retry once.  The retry
+         * runs on the other backend after a switch, or on the active one when
+         * there is nothing left to switch to (the failure may have come from
+         * a stale frame allocated before an earlier switch). */
+        gpu_me_release_frames( h );
+        int switched = !x264_gpu_fallback( h->gpu_ctx );
+        if( gpu_me_prefetch_launch( h, next, refs0, ids0, strides0, n0,
+                                    refs1, ids1, strides1, n1 ) )
+        {
+            x264_log( h, X264_LOG_WARNING, "GPU ME: analysis failed, disabling GPU ME\n" );
+            h->param.analyse.i_gpu_me = 0;
+        }
+        else if( switched )
+            x264_log( h, X264_LOG_WARNING,
+                      "GPU ME: switched to the %s backend after an analysis failure\n",
+                      x264_gpu_backend_id( h->gpu_ctx ) );
     }
 }
 #else

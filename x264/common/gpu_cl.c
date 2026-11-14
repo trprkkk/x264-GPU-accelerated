@@ -466,6 +466,23 @@ static int gpu_cl_analyze_common( void *ctx, gpu_cl_frame_t *frame,
     if( radius < 0 ) radius = 0;
     if( radius > 8 ) radius = 8;
 
+    /* Testing hook: X264_GPU_SIMULATE_FAIL=opencl makes this backend fail at
+     * the first analysis (used to exercise the CUDA fallback). */
+    {
+        static int sim = -1;
+        if( sim < 0 )
+        {
+            const char *ev = getenv( "X264_GPU_SIMULATE_FAIL" );
+            sim = ev && !strcmp( ev, "opencl" );
+        }
+        if( sim )
+        {
+            c->disabled = 1;
+            c->pending_frame = NULL;
+            return -1;
+        }
+    }
+
     frame->nfilled[0] = frame->nfilled[1] = 0;
     frame->pending[0] = frame->pending[1] = 0;
     frame->ctx = c;
@@ -832,6 +849,7 @@ static int gpu_cl_frame_covers( const x264_gpu_frame_t *frame,
 
 extern const x264_gpu_backend_t x264_gpu_backend_cl =
 {
+    X264_GPU_BACKEND_OPENCL,
     "opencl",
     gpu_cl_available,
     gpu_cl_create,

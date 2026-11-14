@@ -1,0 +1,67 @@
+# Phase 5: Multi-architecture CUDA + OpenCL fallback (2026-11-15)
+
+## Why
+
+The released binary carried a single `sm_75` (Turing) SASS image, so any newer
+GPU (Ampere/Ada/Hopper/Blackwell) failed at the first kernel launch and the
+encoder silently fell back to CPU.  Kepler〜Volta GPUs were dropped entirely by
+CUDA Toolkit 13.  Two changes address this:
+
+1. **Multi-architecture CUDA fat binary** - SASS for every architecture that
+   nvcc 13.3 can build (sm_75/80/86/87/89/90/100/120) plus a forward-compatible
+   `compute_75` PTX image that newer GPUs JIT.
+2. **Runtime fallback** - when a backend cannot be created (probe launch fails
+   on unsupported hardware) or an analysis fails at runtime, the encoder
+   retires that backend and continues on the other one, once.  Kepler〜Volta
+   (sm_35〜sm_70) are served by the OpenCL backend in this way.
+
+## What was built
+
+* `common/gpu.h`: backend table now carries an id + short name; new
+  `x264_gpu_fallback()` entry point; frames start with a header recording the
+  owning backend so the dispatcher can route frees after a switch.
+* `common/gpu.c`: rewritten dispatcher.  Auto selection tries CUDA then
+  OpenCL; `x264_gpu_fallback()` drains and retires the failing backend (kept
+  alive for freeing frames it still owns) and creates the other one.
+* `common/gpu.cu`: probe launch in `x264_gpu_cuda_create()` (a 1-thread
+  `downsample4` + stream sync) so a device without a compatible image fails
+  creation instead of failing mid-encode.
+* `encoder/encoder.c`: failure paths in `gpu_me_analyse()` / `gpu_me_prefetch()`
+  release the frames holding the failing backend's buffers, switch once, and
+  retry; when there is nothing to switch to, the retry runs on the active
+  backend (stale frames from a previous switch).  Output stays bit-identical:
+  the switch only changes which engine produces the same candidates.
+* Testing hook `X264_GPU_SIMULATE_FAIL=cuda|opencl` makes the named backend
+  fail at its first analysis.
+* `configure-msvc.sh` / `config.mak`: `CUDA_ARCHS` (default 75 80 86 87 89 90
+  100 120) + `CUDA_PTX` (default 75).
+
+## Verification
+
+| check | result |
+|---|---|
+| `cuobjdump -lelf x264.exe` | SASS: sm_75, sm_80, sm_86, sm_87, sm_89, sm_90, sm_100, sm_120 |
+| `cuobjdump -lptx x264.exe` | PTX: compute_75 (forward-compatible JIT) |
+| imports (`dumpbin /dependents`) | unchanged: SHELL32.dll / KERNEL32.dll only |
+| regression hashes (720p) | g0 `BEB55C36...` / m2 `965066A7...` / m3 `B3090B30...` all match |
+| CUDA == OpenCL (720p m2) | `965066A7...` == `965066A7...` |
+| A/B vs released v1.0.0 binary | 6/6 bit-identical (720p m1/m4/medium m2, 1080p medium m2 / placebo m2/m3) |
+| fallback: CUDA fails in prefetch | switches to OpenCL once, output `965066A7...` (matches) |
+| fallback: CUDA fails in sync analysis (`X264_GPU_ASYNC=0`) | switches to OpenCL once, output `965066A7...` |
+| fallback: forced OpenCL fails (`--gpu-me-backend 2`) | switches to CUDA once, output `965066A7...` |
+| fallback: forced CUDA fails (`--gpu-me-backend 1`) | switches to OpenCL once (initial backend is a hint; documented), output `965066A7...` |
+| `selftest.ps1` | 27/27 PASS (new: CUDA failure falls back to OpenCL, bit-identical) |
+
+Binary: `x264.exe`, 2,828,288 bytes, SHA256
+`A737F91D5CE9F43CB9C3F7BF0612E41C578299294E89D54281829D67079EBB67`
+(replaces the 2,604,032-byte sm_75-only asset in Release v1.0.0).
+
+## Notes
+
+* CUDA Toolkit 13 cannot compile sm_70 and older (verified: sm_35〜sm_72 FAIL,
+  sm_75+ OK), and its runtime needs recent drivers; those GPUs are covered by
+  the OpenCL backend, which uses the driver's own OpenCL (R470+ on Kepler).
+* The probe launch catches "no kernel image for this device" at creation time,
+  so auto-selection moves to OpenCL before any frame is encoded.
+* Fallback triggers only on failures; the normal path is byte-for-byte the
+  same as before (`--gpu-me 0` still matches stock x264 exactly).

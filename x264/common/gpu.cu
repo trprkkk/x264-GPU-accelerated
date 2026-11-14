@@ -311,6 +311,20 @@ extern "C" void *x264_gpu_create( int width, int height, int max_refs, int devic
         if( cudaMalloc( (void**)&c->cache[i].full, fsz ) != cudaSuccess ||
             cudaMalloc( (void**)&c->cache[i].low, lsz ) != cudaSuccess )
             fail = 1;
+    if( !fail )
+    {
+        /* Probe launch: verify that this device can actually run the kernels.
+         * The fat binary carries SASS for several architectures plus a
+         * forward-compatible PTX image, so an older GPU (or a broken driver)
+         * fails here and the dispatcher can fall back to another backend. */
+        downsample4<<<1, 1, 0, c->stream>>>( (uint8_t*)c->d_cur, 16, 16,
+                                             (uint8_t*)c->d_cur_low, 4, 4 );
+        if( cudaStreamSynchronize( c->stream ) != cudaSuccess )
+        {
+            cudaGetLastError();   /* clear the sticky error */
+            fail = 1;
+        }
+    }
     if( fail )
     {
         if( c->stream ) cudaStreamDestroy( c->stream );
@@ -474,6 +488,23 @@ static int gpu_analyze_common( void *ctx, x264_gpu_frame_t *frame,
     if( range > 128 ) range = 128;
     if( radius < 0 ) radius = 0;
     if( radius > 8 ) radius = 8;
+
+    /* Testing hook: X264_GPU_SIMULATE_FAIL=cuda makes this backend fail at
+     * the first analysis (used to exercise the OpenCL fallback). */
+    {
+        static int sim = -1;
+        if( sim < 0 )
+        {
+            const char *ev = getenv( "X264_GPU_SIMULATE_FAIL" );
+            sim = ev && !strcmp( ev, "cuda" );
+        }
+        if( sim )
+        {
+            c->disabled = 1;
+            c->pending_frame = NULL;
+            return -1;
+        }
+    }
 
     std::lock_guard<std::mutex> guard( c->lock );
 
@@ -703,6 +734,7 @@ static int gpu_cuda_available( void )
 
 extern "C" const x264_gpu_backend_t x264_gpu_backend_cuda =
 {
+    X264_GPU_BACKEND_CUDA,
     "cuda",
     gpu_cuda_available,
     x264_gpu_cuda_create,

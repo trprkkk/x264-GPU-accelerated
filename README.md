@@ -24,7 +24,7 @@ H.264 エンコーダです。
 | 対応解像度 | 任意 (x264 準拠。MB 境界までパディングして GPU 解析。1080p も GPU 加速) |
 | 速度 | `--me esa` / `--me tesa` で **+17〜+47%** (2 測定セッション。下記ベンチマーク) |
 | 既定動作 | `--gpu-me 0`。従来と完全に同一・ビット一致 |
-| フォールバック | GPU (CUDA/OpenCL) 無し / 非対応条件では警告を出して自動的に CPU 動作へ |
+| フォールバック | CUDA 不可の GPU は OpenCL へ自動切替。GPU 自体が無い / 非対応条件では警告を出して自動的に CPU 動作へ |
 
 ### モード一覧
 
@@ -45,13 +45,28 @@ H.264 エンコーダです。
 - CUDA Toolkit 13.3 (`nvcc`、`cudart_static.lib`、および OpenCL バックエンド用の CL ヘッダ) — 動作確認: 13.3.73
 - NASM 2.16.03 (`toolchain/nasm-2.16.03` に配置済み。別バージョンでも可)
 - Git Bash + `mingw32-make` (MSYS2/MinGW の make でも可)
-- NVIDIA GPU (Compute Capability 7.5 でビルド確認: RTX 2060 SUPER)
-- OpenCL 1.2+ ランタイム (任意、`--gpu-me-backend 2` 用。動作確認: NVIDIA OpenCL 3.0)
+- NVIDIA GPU: CUDA バックエンドは Turing〜Blackwell (sm_75/80/86/87/89/90/100/120)。
+  Kepler〜Volta (sm_35〜sm_70) は CUDA Toolkit 13 がコンパイル非対応のため、
+  OpenCL バックエンドが担当します (NVIDIA ドライバ同梱の OpenCL を使用)
+- OpenCL 1.2+ ランタイム (任意。`--gpu-me-backend 2` 用。動作確認: NVIDIA OpenCL 3.0)
 
 GPU 対応条件 (これ以外は自動で CPU フォールバック):
 
 - 8-bit エンコード (`--output-depth 8`)
 - プログレッシブ (インターレースは非対応)
+
+GPU 世代ごとのバックエンド (既定の自動選択。実行時に解析が失敗した場合は
+もう一方のバックエンドへ 1 回だけ切り替え、警告を表示します):
+
+| GPU 世代 | CUDA | OpenCL | 備考 |
+|---|---|---|---|
+| Kepler〜Volta (sm_35〜sm_70) | – | ✅ | CUDA 13 が非対応 (OpenCL で動作) |
+| Turing (sm_75) | ✅ | ✅ | 動作確認: RTX 2060 SUPER |
+| Ampere (sm_80/86/87) | ✅ | ✅ | SASS を同梱 |
+| Ada (sm_89) | ✅ | ✅ | SASS を同梱 |
+| Hopper (sm_90) | ✅ | ✅ | SASS を同梱 |
+| Blackwell (sm_100/120) | ✅ | ✅ | SASS を同梱 |
+| それ以降の世代 | ✅ | ✅ | compute_75 PTX を JIT |
 
 解像度は x264 が受け付ける任意のサイズに対応します。フレームプレーンは
 MB 境界までパディングされて解析されるため、1920x1080 のような 16 の倍数で
@@ -79,8 +94,12 @@ cd hybrid-x264-gpu
 > ビット深度定義 (`-DBIT_DEPTH`) なしでスキャンが中断する問題の両方に対応済みで、
 > ヘッダ変更時の差分ビルドが正しく再コンパイルされます。
 >
-> CUDA バックエンドのターゲット GPU は環境変数 `CUDA_ARCH` で指定できます
-> (既定 `sm_75` = Turing。Ampere なら `sm_86` など。`configure-msvc.sh` を参照)。
+> CUDA バックエンドは既定で Turing〜Blackwell (sm_75/80/86/87/89/90/100/120) の
+> SASS と、将来 GPU 用の PTX (compute_75) を 1 つのバイナリに同梱します。
+> 対象は環境変数 `CUDA_ARCHS` / `CUDA_PTX` で指定できます
+> (`configure-msvc.sh` を参照)。CUDA Toolkit 13 は sm_75 未満をコンパイル
+> できないため、Kepler〜Volta は OpenCL バックエンドが担当します
+> (ドライバ同梱の OpenCL を使用。実行時に CUDA が使えない場合は自動で切替)。
 > OpenCL バックエンドは CL ヘッダ (CUDA Toolkit 同梱) を使ってビルドされ、
 > `OpenCL.dll` は実行時に動的ロードします (無い環境でも起動し、OpenCL
 > バックエンドだけが無効になります)。
@@ -127,7 +146,7 @@ x264 --preset slow --crf 23 --gpu-me 2 input.yuv --input-res 1280x720 -o out.264
 | オプション | 既定値 | 説明 |
 |---|---|---|
 | `--gpu-me <0-4>` | `0` | GPU 動き探索モード (上記の表) |
-| `--gpu-me-backend <0-2>` | `0` | バックエンド: 0=自動 (CUDA→OpenCL)、1=CUDA、2=OpenCL |
+| `--gpu-me-backend <0-2>` | `0` | バックエンド: 0=自動 (CUDA→OpenCL)、1=CUDA、2=OpenCL。実行時の解析失敗時はもう一方へ 1 回だけ自動切替 (警告表示) |
 | `--gpu-me-range <int>` | `64` | 粗探索の全解像度換算サーチ範囲 (4〜128) |
 | `--gpu-me-radius <int>` | `2` | 粗探索候補周辺の全解像度リファイン半径 (0〜8) |
 | `--gpu-me-refs <int>` | `2` | GPU 解析する参照フレーム数 (0 = すべて、最大 4) |
@@ -301,6 +320,8 @@ x264 [warning]: GPU ME: no usable GPU backend, falling back to CPU
 | 非 16 倍数解像度 (1920x1080 / 1280x718) | ✅ MB 境界パディングで GPU 加速 (mode 2 が CUDA 有効で動作) |
 | 非同期プリフェッチ (`X264_GPU_ASYNC`) | ✅ 出力はビット一致のまま (全回帰ハッシュ一致)。GPU 待ち時間 ≈0.002 ms/frame、実測 +1% 前後 |
 | OpenCL バックエンド (`--gpu-me-backend 2`) | ✅ CUDA とビット単位で同一ストリーム (720p/1080p、mode 2/3)。selftest で自動検証 |
+| CUDA アーキテクチャ (配布バイナリ) | ✅ SASS sm_75/80/86/87/89/90/100/120 + compute_75 PTX を同梱 (cuobjdump で確認)。Kepler〜Volta は OpenCL が担当 |
+| 実行時バックエンドフォールバック | ✅ 起動時プローブで非対応 GPU を検出、解析失敗時はもう一方へ 1 回切替 (出力はビット一致のまま)。selftest で自動検証 |
 | 10-bit 出力 | ✅ 警告を出して CPU フォールバック |
 | インターレース | ✅ 警告を出して CPU フォールバック |
 | GPU モードの再現性 (同一入力・同一設定) | ✅ mode 1/2/3 の反復実行が SHA-1 一致 (240 frames placebo) |
@@ -308,7 +329,7 @@ x264 [warning]: GPU ME: no usable GPU backend, falling back to CPU
 | NVENC (固定機能) との画質比較 | ✅ 5 レート帯すべてで少ないビットで高 SSIM/PSNR (BD-rate −33.6% / −40.7%) |
 | 品質ゲート (BD-rate × 3クリップ) | ✅ PASS (26比較。最悪 SSIM +1.92% は mode 3/4 の 1080p、mode 2 は +0.37% 以内) |
 | ヘッダ変更時の差分ビルド | ✅ `.d` が全インクルードヘッダを記録 (msvsdepend.sh 修正) |
-| `selftest.ps1` (受け入れテスト 26 項目) | ✅ 全合格 |
+| `selftest.ps1` (受け入れテスト 27 項目) | ✅ 全合格 |
 | フルクリーンビルド (configure から) | ✅ 再現確認済み |
 
 ---
@@ -371,10 +392,17 @@ x264_encoder_encode()
 
 - 選択: `--gpu-me-backend 0|1|2` (既定 0 = 自動で CUDA → OpenCL の順に試行)。
   使用中のバックエンドとデバイスは起動ログ (`GPU ME: <backend> / <device>`) に表示。
+- **実行時フォールバック。** 起動時に CUDA カーネルが動かない GPU (非対応
+  アーキテクチャ等) は作成時のプローブ起動で検出し、自動選択が OpenCL を
+  選びます。エンコード中に解析が失敗した場合も、そのバックエンドを退役させて
+  もう一方へ 1 回だけ切り替えます (保持していた候補バッファは解放して作り直し、
+  `GPU ME: switched to the <backend> backend` の警告を表示)。どちらも
+  使えない場合は従来どおり警告を出して CPU 動作になります。
 - **両バックエンドの出力はビット単位で一致します。** カーネルは走査順・比較
   演算子まで同一で、候補は参照の同一性 (プレーン先頭ポインタ + `i_frame`) で
   照合されます。バックエンド名は SEI のパラメータ文字列に含めないため、
-  ストリームをそのままハッシュ比較できます (selftest で自動検証)。
+  ストリームをそのままハッシュ比較できます (selftest で自動検証)。切替が
+  発生しても、切替後の出力は切替前と同じビットストリームになります。
 - 転送は両バックエンドともピン留めステージングを使い、非同期プリフェッチが
   そのまま動作します。OpenCL は同一出力のまま CUDA よりわずかに低速です
   (実測: esa 24 mode 2・240 フレームで CUDA 8.82 s / OpenCL 9.17 s)。
@@ -410,7 +438,7 @@ x264_encoder_encode()
 
 | ファイル | 変更内容 |
 |---|---|
-| `common/gpu.h` / `common/gpu.c` | 新規。公開 API とバックエンド・ディスパッチャ |
+| `common/gpu.h` / `common/gpu.c` | 新規。公開 API とバックエンド・ディスパッチャ (実行時フォールバックとフレーム所有権の振り分けを含む) |
 | `common/gpu.cu` | 新規。CUDA バックエンド (カーネル、転送、キャッシュ) |
 | `common/gpu_cl.c` | 新規。OpenCL バックエンド (CUDA と同一アルゴリズム・同一出力) |
 | `x264.h` | `x264_param_t.analyse` に `i_gpu_me*` を追加 |
@@ -419,9 +447,9 @@ x264_encoder_encode()
 | `common/common.h` | エンコーダごとの GPU コンテキスト (`gpu_ctx`) |
 | `encoder/encoder.c` | GPU コンテキストの生成/破棄、`gpu_me_analyse()`、フォールバック警告 |
 | `encoder/me.h` / `encoder/analyse.c` | `x264_me_t` に `i_list` / `i_xoff` / `i_yoff` を追加し、候補検索用の情報を設定 |
-| `encoder/me.c` | GPU 候補の注入 (mode 1/2/3)。`i_list >= 0` を必須条件とする |
+| `encoder/me.c` | GPU 候補の注入 (mode 1/2/3/4)。`i_list >= 0` を必須条件とする |
 | `encoder/slicetype.c` | ルックアヘッドの低解像度 ME に `i_list = -1` を設定し、GPU 候補の注入対象外にする |
-| `Makefile` | `common/gpu.o` のビルド (nvcc) と `cudart_static.lib` のリンク |
+| `Makefile` | `common/gpu*.o` (ディスパッチャ / CUDA / OpenCL) のビルドと `cudart_static.lib` のリンク |
 | `x264/tools/msvsdepend.sh` | Windows 差分ビルドのヘッダ依存生成を修正 (日本語ロケールの `/showIncludes` 対応、ビット深度定義の付与、失敗時のビルド中断) |
 | `configure-msvc.sh` / `make-msvc.sh` | GPU 設定 (CUDA / OpenCL) の追記とライブラリパス設定 |
 | `dev/gpu_me_bench.cu` | 開発用の単体 CUDA ベンチマーク (エンコーダ本体にはリンクされません) |
@@ -433,6 +461,9 @@ x264_encoder_encode()
 
 - **8-bit のみ**。10-bit / 12-bit エンコードでは GPU は使われません (CPU フォールバック)。
 - **インターレース非対応** (CPU フォールバック)。
+- **CUDA バックエンドは Turing (sm_75) 以降のみ**。Kepler〜Volta は CUDA
+  Toolkit 13 がコンパイル非対応のため、OpenCL バックエンドで動作します
+  (ドライバ同梱の OpenCL を使用)。
 - **x265/HEVC 版は未収録**。本フォークは x264 (H.264) のみです。
 - **OpenCL バックエンドは NVIDIA 実機のみ検証済み**。カーネルはポータブルな
   OpenCL C 1.2 の範囲のみ使用していますが、AMD/Intel 実機での検証は未実施です。
