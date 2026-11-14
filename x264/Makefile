@@ -271,7 +271,7 @@ endif
 ifeq ($(HAVE_CUDA),1)
 OBJCU = common/gpu.o common/gpu_cuda.o common/gpu_cl.o
 OBJS += $(OBJCU)
-LDFLAGSCLI += $(CUDALIBS) $(OPENCL_LIB)
+LDFLAGSCLI += $(CUDALIBS)
 common/gpu.o: common/gpu.c $(SRCPATH)/common/gpu.h
 	$(CC) $(CFLAGS) -c $< $(CC_O)
 common/gpu_cuda.o: common/gpu.cu $(SRCPATH)/common/gpu.h

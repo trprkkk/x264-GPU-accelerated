@@ -42,7 +42,7 @@ H.264 エンコーダです。
 
 - Windows x64
 - Visual Studio (C++ ツールセット。動作確認: VS 18 Community / cl 19.51)
-- CUDA Toolkit 13.3 (`nvcc`、`cudart_static.lib`、および OpenCL バックエンド用の CL ヘッダ / `OpenCL.lib`) — 動作確認: 13.3.73
+- CUDA Toolkit 13.3 (`nvcc`、`cudart_static.lib`、および OpenCL バックエンド用の CL ヘッダ) — 動作確認: 13.3.73
 - NASM 2.16.03 (`toolchain/nasm-2.16.03` に配置済み。別バージョンでも可)
 - Git Bash + `mingw32-make` (MSYS2/MinGW の make でも可)
 - NVIDIA GPU (Compute Capability 7.5 でビルド確認: RTX 2060 SUPER)
@@ -81,8 +81,16 @@ cd hybrid-x264-gpu
 >
 > CUDA バックエンドのターゲット GPU は環境変数 `CUDA_ARCH` で指定できます
 > (既定 `sm_75` = Turing。Ampere なら `sm_86` など。`configure-msvc.sh` を参照)。
-> OpenCL バックエンドは CL ヘッダと `OpenCL.lib` (CUDA Toolkit 同梱) を使って
-> ビルドされ、実行時は GPU ドライバが提供する OpenCL 実装 (OpenCL.dll) をロードします。
+> OpenCL バックエンドは CL ヘッダ (CUDA Toolkit 同梱) を使ってビルドされ、
+> `OpenCL.dll` は実行時に動的ロードします (無い環境でも起動し、OpenCL
+> バックエンドだけが無効になります)。
+
+> ビルド済みの Windows x64 バイナリ (`x264.exe`) は
+> [Releases](https://github.com/trprkkk/x264-GPU-accelerated/releases) で配布しています。
+> 単体で動作し (同梱 DLL 不要。依存は Windows 標準の SHELL32 / KERNEL32 のみ)、
+> NVIDIA ドライバがあれば CUDA バックエンド、その他の OpenCL ドライバでも
+> OpenCL バックエンドが使えます。どちらも無い環境では警告を出して CPU エンコードに
+> 切り替わります。
 
 Windows のコマンドプロンプトから一括で行う場合は同梱のバッチを使用します
 (内部で `vcvars64.bat` を呼び、Git Bash 経由で make を実行します)。

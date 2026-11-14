@@ -21,6 +21,150 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+/* OpenCL is loaded dynamically (like x264's own OpenCL path does) so the
+ * executable starts on machines without an OpenCL ICD; the backend simply
+ * reports itself unavailable in that case. */
+static cl_int (CL_API_CALL *p_clGetPlatformIDs)( cl_uint, cl_platform_id *, cl_uint * );
+static cl_int (CL_API_CALL *p_clGetDeviceIDs)( cl_platform_id, cl_device_type, cl_uint, cl_device_id *, cl_uint * );
+static cl_int (CL_API_CALL *p_clGetDeviceInfo)( cl_device_id, cl_device_info, size_t, void *, size_t * );
+static cl_context (CL_API_CALL *p_clCreateContext)( const cl_context_properties *, cl_uint, const cl_device_id *,
+                                                    void (CL_CALLBACK *)( const char *, const void *, size_t, void * ),
+                                                    void *, cl_int * );
+static cl_command_queue (CL_API_CALL *p_clCreateCommandQueue)( cl_context, cl_device_id,
+                                                               cl_command_queue_properties, cl_int * );
+static cl_program (CL_API_CALL *p_clCreateProgramWithSource)( cl_context, cl_uint, const char **,
+                                                              const size_t *, cl_int * );
+static cl_int (CL_API_CALL *p_clBuildProgram)( cl_program, cl_uint, const cl_device_id *, const char *,
+                                               void (CL_CALLBACK *)( cl_program, void * ), void * );
+static cl_int (CL_API_CALL *p_clGetProgramBuildInfo)( cl_program, cl_device_id, cl_program_build_info,
+                                                      size_t, void *, size_t * );
+static cl_kernel (CL_API_CALL *p_clCreateKernel)( cl_program, const char *, cl_int * );
+static cl_int (CL_API_CALL *p_clSetKernelArg)( cl_kernel, cl_uint, size_t, const void * );
+static cl_int (CL_API_CALL *p_clEnqueueNDRangeKernel)( cl_command_queue, cl_kernel, cl_uint, const size_t *,
+                                                       const size_t *, const size_t *, cl_uint,
+                                                       const cl_event *, cl_event * );
+static cl_mem (CL_API_CALL *p_clCreateBuffer)( cl_context, cl_mem_flags, size_t, void *, cl_int * );
+static cl_int (CL_API_CALL *p_clEnqueueWriteBuffer)( cl_command_queue, cl_mem, cl_bool, size_t, size_t,
+                                                     const void *, cl_uint, const cl_event *, cl_event * );
+static cl_int (CL_API_CALL *p_clEnqueueReadBuffer)( cl_command_queue, cl_mem, cl_bool, size_t, size_t,
+                                                    void *, cl_uint, const cl_event *, cl_event * );
+static cl_int (CL_API_CALL *p_clFinish)( cl_command_queue );
+static void * (CL_API_CALL *p_clEnqueueMapBuffer)( cl_command_queue, cl_mem, cl_bool, cl_map_flags, size_t, size_t,
+                                                   cl_uint, const cl_event *, cl_event *, cl_int * );
+static cl_int (CL_API_CALL *p_clEnqueueUnmapMemObject)( cl_command_queue, cl_mem, void *, cl_uint,
+                                                        const cl_event *, cl_event * );
+static cl_int (CL_API_CALL *p_clReleaseMemObject)( cl_mem );
+static cl_int (CL_API_CALL *p_clReleaseKernel)( cl_kernel );
+static cl_int (CL_API_CALL *p_clReleaseProgram)( cl_program );
+static cl_int (CL_API_CALL *p_clReleaseCommandQueue)( cl_command_queue );
+static cl_int (CL_API_CALL *p_clReleaseContext)( cl_context );
+
+#define clGetPlatformIDs       p_clGetPlatformIDs
+#define clGetDeviceIDs         p_clGetDeviceIDs
+#define clGetDeviceInfo        p_clGetDeviceInfo
+#define clCreateContext        p_clCreateContext
+#define clCreateCommandQueue   p_clCreateCommandQueue
+#define clCreateProgramWithSource p_clCreateProgramWithSource
+#define clBuildProgram         p_clBuildProgram
+#define clGetProgramBuildInfo  p_clGetProgramBuildInfo
+#define clCreateKernel         p_clCreateKernel
+#define clSetKernelArg         p_clSetKernelArg
+#define clEnqueueNDRangeKernel p_clEnqueueNDRangeKernel
+#define clCreateBuffer         p_clCreateBuffer
+#define clEnqueueWriteBuffer   p_clEnqueueWriteBuffer
+#define clEnqueueReadBuffer    p_clEnqueueReadBuffer
+#define clFinish               p_clFinish
+#define clEnqueueMapBuffer     p_clEnqueueMapBuffer
+#define clEnqueueUnmapMemObject p_clEnqueueUnmapMemObject
+#define clReleaseMemObject     p_clReleaseMemObject
+#define clReleaseKernel        p_clReleaseKernel
+#define clReleaseProgram       p_clReleaseProgram
+#define clReleaseCommandQueue  p_clReleaseCommandQueue
+#define clReleaseContext       p_clReleaseContext
+
+static void *gpu_cl_lib;
+static int gpu_cl_load_state = -1;
+
+#ifdef _WIN32
+#define GPU_CL_LOAD( name ) p_##name = (void*)GetProcAddress( (HMODULE)gpu_cl_lib, #name );
+#else
+#define GPU_CL_LOAD( name ) p_##name = (void*)dlsym( gpu_cl_lib, #name );
+#endif
+
+static int gpu_cl_load( void )
+{
+    if( gpu_cl_load_state >= 0 )
+        return gpu_cl_load_state;
+#ifdef _WIN32
+    gpu_cl_lib = (void*)LoadLibraryW( L"OpenCL.dll" );
+#else
+    gpu_cl_lib = dlopen( "libOpenCL.so", RTLD_NOW );
+#endif
+    if( !gpu_cl_lib )
+    {
+        gpu_cl_load_state = 0;
+        return 0;
+    }
+    GPU_CL_LOAD( clGetPlatformIDs )
+    GPU_CL_LOAD( clGetDeviceIDs )
+    GPU_CL_LOAD( clGetDeviceInfo )
+    GPU_CL_LOAD( clCreateContext )
+    GPU_CL_LOAD( clCreateCommandQueue )
+    GPU_CL_LOAD( clCreateProgramWithSource )
+    GPU_CL_LOAD( clBuildProgram )
+    GPU_CL_LOAD( clGetProgramBuildInfo )
+    GPU_CL_LOAD( clCreateKernel )
+    GPU_CL_LOAD( clSetKernelArg )
+    GPU_CL_LOAD( clEnqueueNDRangeKernel )
+    GPU_CL_LOAD( clCreateBuffer )
+    GPU_CL_LOAD( clEnqueueWriteBuffer )
+    GPU_CL_LOAD( clEnqueueReadBuffer )
+    GPU_CL_LOAD( clFinish )
+    GPU_CL_LOAD( clEnqueueMapBuffer )
+    GPU_CL_LOAD( clEnqueueUnmapMemObject )
+    GPU_CL_LOAD( clReleaseMemObject )
+    GPU_CL_LOAD( clReleaseKernel )
+    GPU_CL_LOAD( clReleaseProgram )
+    GPU_CL_LOAD( clReleaseCommandQueue )
+    GPU_CL_LOAD( clReleaseContext )
+#undef GPU_CL_LOAD
+    gpu_cl_load_state = 1;
+#define GPU_CL_CHECK( name ) \
+    if( !p_##name ) { fprintf( stderr, "x264 OpenCL ME: missing OpenCL symbol %s\n", #name ); \
+                      gpu_cl_load_state = 0; }
+    GPU_CL_CHECK( clGetPlatformIDs )
+    GPU_CL_CHECK( clGetDeviceIDs )
+    GPU_CL_CHECK( clGetDeviceInfo )
+    GPU_CL_CHECK( clCreateContext )
+    GPU_CL_CHECK( clCreateCommandQueue )
+    GPU_CL_CHECK( clCreateProgramWithSource )
+    GPU_CL_CHECK( clBuildProgram )
+    GPU_CL_CHECK( clGetProgramBuildInfo )
+    GPU_CL_CHECK( clCreateKernel )
+    GPU_CL_CHECK( clSetKernelArg )
+    GPU_CL_CHECK( clEnqueueNDRangeKernel )
+    GPU_CL_CHECK( clCreateBuffer )
+    GPU_CL_CHECK( clEnqueueWriteBuffer )
+    GPU_CL_CHECK( clEnqueueReadBuffer )
+    GPU_CL_CHECK( clFinish )
+    GPU_CL_CHECK( clEnqueueMapBuffer )
+    GPU_CL_CHECK( clEnqueueUnmapMemObject )
+    GPU_CL_CHECK( clReleaseMemObject )
+    GPU_CL_CHECK( clReleaseKernel )
+    GPU_CL_CHECK( clReleaseProgram )
+    GPU_CL_CHECK( clReleaseCommandQueue )
+    GPU_CL_CHECK( clReleaseContext )
+#undef GPU_CL_CHECK
+    if( !gpu_cl_load_state )
+        fprintf( stderr, "x264 OpenCL ME: OpenCL runtime is not usable\n" );
+    return gpu_cl_load_state;
+}
 
 #define GK X264_GPU_CANDS
 
@@ -207,6 +351,8 @@ static const char *gpu_cl_source =
 static int gpu_cl_available( void )
 {
     cl_uint np = 0, nd = 0;
+    if( !gpu_cl_load() )
+        return 0;
     if( clGetPlatformIDs( 1, NULL, &np ) != CL_SUCCESS || !np )
         return 0;
     cl_platform_id plats[8];
@@ -425,6 +571,8 @@ static int gpu_cl_analyze_common( void *ctx, gpu_cl_frame_t *frame,
 static void *gpu_cl_create( int width, int height, int max_refs, int device )
 {
     if( width <= 0 || height <= 0 || (width & 15) || (height & 15) )
+        return NULL;
+    if( !gpu_cl_load() )
         return NULL;
     cl_device_id dev = gpu_cl_pick_device( device );
     if( !dev )

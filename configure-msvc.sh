@@ -30,6 +30,5 @@ NVCC=${CUDA_ROOT}/bin/nvcc.exe
 CUDAFLAGS=-O3 -std=c++14 -arch=${CUDA_ARCH} -I\$(SRCPATH)
 CUDALIBS=cudart_static.lib
 OPENCL_INC=-I"${CUDA_ROOT}/include"
-OPENCL_LIB="${CUDA_ROOT}/lib/x64/OpenCL.lib"
 EOF
 fi
