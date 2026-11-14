@@ -529,6 +529,22 @@ build-msvc\x264.exe --preset placebo --crf 23 --threads 1 --gpu-me 2 --gpu-me-ba
 Get-FileHash a.264, b.264 -Algorithm SHA1   # 同じハッシュになる
 ```
 
+バックエンドの実行時フォールバックの検証 (`X264_GPU_SIMULATE_FAIL` は指定した
+バックエンドを最初の解析で失敗させるテスト用フックです):
+
+```powershell
+# CUDA を失敗させ、OpenCL へ自動切替することを確認 (出力は a.264 と同一)
+$env:X264_GPU_SIMULATE_FAIL = "cuda"
+build-msvc\x264.exe --preset placebo --crf 23 --threads 1 --gpu-me 2 `
+    testdata\motion720p.yuv --input-res 1280x720 --fps 30 -o c.264
+# 標準エラーに "GPU ME: switched to the opencl backend after an analysis failure"
+Get-FileHash c.264 -Algorithm SHA1          # a.264 と同じハッシュになる
+Remove-Item Env:\X264_GPU_SIMULATE_FAIL
+```
+
+> `X264_GPU_ASYNC=0` を併用すると、先出し解析ではなく同期解析側の失敗経路も
+> 検証できます (どちらも同じ切替動作)。
+
 受け入れテスト (ビット一致・全 GPU モードの動作・デコード・フォールバック・決定性):
 
 ```powershell
