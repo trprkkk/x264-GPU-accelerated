@@ -1,4 +1,4 @@
-// CUDA implementation of the hierarchical candidate generator.
+// CUDA host implementation of the hierarchical candidate generator.
 //
 // The GPU does a coarse exhaustive search on a quarter-resolution luma copy
 // and then refines the best four integer-pel positions at full resolution.
@@ -8,10 +8,35 @@
 // function, so rate control, RDO, entropy coding and the bitstream syntax stay
 // exactly in the original CPU code.
 //
-// This file is the CUDA backend; the public API (dispatcher) is gpu.c and the
-// symbols here carry the x264_gpu_cuda_ prefix.
+// This file is the CUDA backend host side; the public API (dispatcher) is
+// gpu.c and the symbols here carry the x264_gpu_cuda_ prefix.
+//
+// Device code lives in gpu_kernels.cu and is compiled to fat binaries by nvcc
+// (CUDA 11.8 for sm_35..sm_90, CUDA 13.x for the newer architectures).  The
+// fat binaries are embedded in x264.exe as RCDATA resources and loaded here
+// through the CUDA driver API from nvcuda.dll, which is loaded dynamically:
+// no CUDA runtime library has to be present, the kernels can come from two
+// different toolkits, and the host code stays independent of the (much newer)
+// nvcc that could no longer build for older GPUs.  The host API (memory,
+// streams, copies) uses the CUDA runtime (cudart, statically linked) with
+// CUDA 11.8, which is the last runtime that supports Kepler..Volta drivers.
+//
+// The fat binary is picked from the device's compute capability:
+//   * cc < 10  -> legacy image (CUDA 11.8: sm_35..sm_90 + compute_75 PTX)
+//   * cc >= 10 -> modern image (CUDA 13.x: sm_100/sm_120 + compute_90 PTX)
+// When the preferred image cannot be loaded (missing resource, unsupported
+// device, ...) the other one is tried; if that fails too, x264_gpu_create()
+// returns NULL and the dispatcher falls back to OpenCL or the CPU.
+
+/* x264 ships an extras/stdint.h fallback which, following C++98, only defines
+ * the (U)INT*_MIN/MAX macros when these are requested; the C++ headers used
+ * below (through <ratio>) need them, and the decision is latched when
+ * <stdint.h> is first included. */
+#define __STDC_LIMIT_MACROS
+#define __STDC_CONSTANT_MACROS
 
 #include "gpu.h"
+#include "gpu_kernels.h"
 
 /* Rename the backend entry points (definitions below only; the public
  * declarations from gpu.h keep their names and are implemented by gpu.c). */
@@ -33,27 +58,106 @@ extern "C" x264_gpu_frame_t *x264_gpu_frame_alloc( int mbw, int mbh, int nref0, 
 extern "C" void x264_gpu_frame_free( x264_gpu_frame_t *frame );
 extern "C" int  x264_gpu_finish( void *ctx );
 
+/* CUDA 11.8 predates the MSVC toolchain used here; the runtime API and the
+ * headers work fine, only the version gates in crt/host_config.h refuse the
+ * newer compiler. */
+#define __NV_NO_HOST_COMPILER_CHECK
+#include <cuda.h>
 #include <cuda_runtime.h>
+
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <chrono>
 #include <mutex>
+
+/* Resource ids of the embedded kernel images (kept in sync with the generated
+ * resource script, see the Makefile). */
+#define GPU_RES_LEGACY 101
+#define GPU_RES_MODERN 102
 
 #define GK X264_GPU_CANDS
 
-static double gpu_now_ms()
+/* --- CUDA driver API, loaded dynamically from nvcuda.dll ------------------ */
+
+namespace
 {
-    using namespace std::chrono;
-    return duration<double, std::milli>( steady_clock::now().time_since_epoch() ).count();
+struct GpuDriverApi
+{
+    decltype(&cuModuleLoadData)          cuModuleLoadData;
+    decltype(&cuModuleGetFunction)       cuModuleGetFunction;
+    decltype(&cuModuleUnload)            cuModuleUnload;
+    decltype(&cuLaunchKernel)            cuLaunchKernel;
+    decltype(&cuCtxSetCurrent)           cuCtxSetCurrent;
+    decltype(&cuDeviceGet)               cuDeviceGet;
+    decltype(&cuDevicePrimaryCtxRetain)  cuDevicePrimaryCtxRetain;
+    decltype(&cuDevicePrimaryCtxRelease) cuDevicePrimaryCtxRelease;
+};
 }
 
-typedef struct
+static GpuDriverApi g_drv;
+static int g_drv_state = -1;   /* -1: unknown, 0: unavailable, 1: ready */
+
+static int gpu_drv_load( void )
 {
-    int16_t  mv[2];
-    uint32_t sad;
-} Cand;
+    if( g_drv_state >= 0 )
+        return g_drv_state;
+    HMODULE lib = LoadLibraryW( L"nvcuda.dll" );
+    if( !lib )
+    {
+        g_drv_state = 0;
+        return 0;
+    }
+    #define GPU_DRV_LOAD( name ) (FARPROC&)g_drv.name = GetProcAddress( lib, #name )
+    GPU_DRV_LOAD( cuModuleLoadData );
+    GPU_DRV_LOAD( cuModuleGetFunction );
+    GPU_DRV_LOAD( cuModuleUnload );
+    GPU_DRV_LOAD( cuLaunchKernel );
+    GPU_DRV_LOAD( cuCtxSetCurrent );
+    GPU_DRV_LOAD( cuDeviceGet );
+    GPU_DRV_LOAD( cuDevicePrimaryCtxRetain );
+    GPU_DRV_LOAD( cuDevicePrimaryCtxRelease );
+    #undef GPU_DRV_LOAD
+    g_drv_state = g_drv.cuModuleLoadData && g_drv.cuModuleGetFunction &&
+                  g_drv.cuModuleUnload && g_drv.cuLaunchKernel &&
+                  g_drv.cuCtxSetCurrent &&
+                  g_drv.cuDeviceGet && g_drv.cuDevicePrimaryCtxRetain &&
+                  g_drv.cuDevicePrimaryCtxRelease;
+    return g_drv_state;
+}
+
+/* Kernel images embedded as RCDATA resources in the executable. */
+static const void *gpu_res_blob( int id, size_t *size )
+{
+    HRSRC res = FindResourceW( NULL, MAKEINTRESOURCEW( id ), (LPCWSTR)RT_RCDATA );
+    if( !res )
+        return NULL;
+    DWORD sz = SizeofResource( NULL, res );
+    if( !sz )
+        return NULL;
+    HGLOBAL dat = LoadResource( NULL, res );
+    if( !dat )
+        return NULL;
+    const void *p = LockResource( dat );
+    if( !p )
+        return NULL;
+    *size = (size_t)sz;
+    return p;
+}
+
+static double gpu_now_ms()
+{
+    static LARGE_INTEGER freq = {};
+    LARGE_INTEGER c;
+    if( !freq.QuadPart )
+        QueryPerformanceFrequency( &freq );
+    QueryPerformanceCounter( &c );
+    return (double)c.QuadPart * 1000.0 / (double)freq.QuadPart;
+}
 
 struct x264_gpu_ctx_t;
 
@@ -74,6 +178,12 @@ struct x264_gpu_frame_t
     struct x264_gpu_ctx_t *ctx;    /* owner, for sync-on-free */
 };
 
+/* Pinned staging ring for reference uploads.  Two buffers are alternated and
+ * each async copy out of a buffer is fenced with an event, so an upload that
+ * starts while the previous copy is still reading its staging buffer cannot
+ * corrupt it (the two are of comparable speed on old, slow PCIe links). */
+#define X264_GPU_STAGE 2
+
 struct x264_gpu_ctx_t
 {
     int w, h, lw, lh, mbw, mbh, max_refs, device;
@@ -85,8 +195,18 @@ struct x264_gpu_ctx_t
     std::mutex lock;
     int disabled;
     x264_gpu_frame_t *pending_frame;   /* analysis in flight (async prefetch) */
-    uint8_t *h_ref;            /* pinned staging for reference uploads */
+    uint8_t *h_ref[X264_GPU_STAGE];    /* pinned staging ring for ref uploads */
+    cudaEvent_t stage_done[X264_GPU_STAGE];
+    int stage_next;
     Cand    *h_out;            /* pinned staging for candidate D2H copies */
+    /* Kernel module (loaded from an embedded fat binary). */
+    CUmodule module;
+    CUfunction fn_ds;          /* downsample4 */
+    CUfunction fn_coarse;      /* coarse_search */
+    CUfunction fn_refine;      /* refine_search */
+    CUcontext cu_ctx;          /* primary context (retained when we created it) */
+    CUdevice  cu_dev;
+    int cu_retained;
     /* Optional per-stage timing (enabled with X264_GPU_TIMING=1). */
     int timing;
     long long nframes;
@@ -111,151 +231,14 @@ struct x264_gpu_ctx_t
 
 static char gpu_name[256] = "CUDA device";
 
-__device__ __forceinline__ uint32_t sad4x4( const uint8_t *a, int as,
-                                            const uint8_t *b, int bs )
+/* Launch one of the module's kernels on the analysis stream. */
+static int gpu_launch( x264_gpu_ctx_t *c, CUfunction fn, dim3 grid, dim3 block, void **args )
 {
-    uint32_t s = 0;
-#pragma unroll
-    for( int j = 0; j < 4; j++ )
-#pragma unroll
-        for( int i = 0; i < 4; i++ )
-        {
-            int d = (int)a[j*as+i] - (int)b[j*bs+i];
-            s += (uint32_t)(d < 0 ? -d : d);
-        }
-    return s;
-}
-
-__device__ __forceinline__ void insert_topk( Cand *best, int x, int y, uint32_t sad )
-{
-    if( sad >= best[GK-1].sad )
-        return;
-    int i = GK - 1;
-    while( i > 0 && sad < best[i-1].sad )
-    {
-        best[i] = best[i-1];
-        i--;
-    }
-    best[i].mv[0] = (int16_t)x;
-    best[i].mv[1] = (int16_t)y;
-    best[i].sad = sad;
-}
-
-__global__ void downsample4( const uint8_t *__restrict__ src, int sw, int sh,
-                             uint8_t *__restrict__ dst, int dw, int dh )
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if( x >= dw || y >= dh )
-        return;
-    int sx = x * 4, sy = y * 4;
-    int sum = 0;
-#pragma unroll
-    for( int j = 0; j < 4; j++ )
-#pragma unroll
-        for( int i = 0; i < 4; i++ )
-        {
-            int px = min( sx + i, sw - 1 );
-            int py = min( sy + j, sh - 1 );
-            sum += src[py * sw + px];
-        }
-    dst[y * dw + x] = (uint8_t)((sum + 8) >> 4);
-}
-
-__global__ void coarse_search( const uint8_t *__restrict__ cur, int cw, int ch,
-                               const uint8_t *__restrict__ ref, int rw, int rh,
-                               int mbw, int mbh, int range, Cand *out )
-{
-    int mb = blockIdx.x * blockDim.x + threadIdx.x;
-    if( mb >= mbw * mbh )
-        return;
-    int mx = mb % mbw, my = mb / mbw;
-    int bx = mx * 4, by = my * 4;
-    Cand best[GK];
-#pragma unroll
-    for( int i = 0; i < GK; i++ )
-    {
-        best[i].mv[0] = 0;
-        best[i].mv[1] = 0;
-        best[i].sad = 0xFFFFFFFFu;
-    }
-    /* The full-resolution range is expressed in luma pixels; the quarter
-     * resolution grid covers it with range/4 steps.  The first pass runs on
-     * a two-step grid, the second pass tests the eight neighbours of the
-     * winner, so the grid is only ~1/4 as expensive with practically the
-     * same result. */
-    int r = range / 4;
-    if( r < 1 )
-        r = 1;
-    for( int dy = -r; dy <= r; dy += 2 )
-        for( int dx = -r; dx <= r; dx += 2 )
-        {
-            int x = max( 0, min( bx + dx, cw - 4 ) );
-            int y = max( 0, min( by + dy, ch - 4 ) );
-            uint32_t sad = sad4x4( cur + by * cw + bx, cw, ref + y * rw + x, rw );
-            insert_topk( best, (x - bx) * 4, (y - by) * 4, sad );
-        }
-    int fx = bx + best[0].mv[0] / 4;
-    int fy = by + best[0].mv[1] / 4;
-    for( int dy = -1; dy <= 1; dy++ )
-        for( int dx = -1; dx <= 1; dx++ )
-        {
-            if( !dx && !dy )
-                continue;
-            int x = max( 0, min( fx + dx, cw - 4 ) );
-            int y = max( 0, min( fy + dy, ch - 4 ) );
-            uint32_t sad = sad4x4( cur + by * cw + bx, cw, ref + y * rw + x, rw );
-            insert_topk( best, (x - bx) * 4, (y - by) * 4, sad );
-        }
-    for( int i = 0; i < GK; i++ )
-        out[mb * GK + i] = best[i];
-}
-
-__global__ void refine_search( const uint8_t *__restrict__ cur, int cw, int ch,
-                               const uint8_t *__restrict__ ref, int rw, int rh,
-                               int mbw, int mbh, int radius,
-                               const Cand *__restrict__ coarse, Cand *out )
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = mbw * mbh * GK;
-    if( idx >= total )
-        return;
-    int mb = idx / GK;
-    int mx = mb % mbw, my = mb / mbw;
-    int bx = mx * 16, by = my * 16;
-    int cx = bx + coarse[idx].mv[0];
-    int cy = by + coarse[idx].mv[1];
-    const uint8_t *pc = cur + by * cw + bx;
-    Cand best;
-    best.mv[0] = 0;
-    best.mv[1] = 0;
-    best.sad = 0xFFFFFFFFu;
-    for( int dy = -radius; dy <= radius; dy++ )
-        for( int dx = -radius; dx <= radius; dx++ )
-        {
-            int x = max( 0, min( cx + dx, cw - 16 ) );
-            int y = max( 0, min( cy + dy, ch - 16 ) );
-            const uint8_t *pr = ref + y * rw + x;
-            uint32_t sad = 0;
-            /* Subsample the 16x16 block with a stride of two pixels.  The
-             * candidates are re-scored on the CPU with the real x264 metric,
-             * so this only needs to rank positions, not to be exact. */
-#pragma unroll
-            for( int j = 0; j < 16; j += 2 )
-#pragma unroll
-                for( int i = 0; i < 16; i += 2 )
-                {
-                    int d = (int)pc[j*cw+i] - (int)pr[j*rw+i];
-                    sad += (uint32_t)(d < 0 ? -d : d);
-                }
-            if( sad < best.sad )
-            {
-                best.sad = sad;
-                best.mv[0] = (int16_t)(x - bx);
-                best.mv[1] = (int16_t)(y - by);
-            }
-        }
-    out[idx] = best;
+    if( !fn || g_drv.cuLaunchKernel( fn, grid.x, grid.y, grid.z,
+                                     block.x, block.y, block.z,
+                                     0, (CUstream)c->stream, args, NULL ) != CUDA_SUCCESS )
+        return -1;
+    return 0;
 }
 
 extern "C" void *x264_gpu_create( int width, int height, int max_refs, int device )
@@ -266,21 +249,48 @@ extern "C" void *x264_gpu_create( int width, int height, int max_refs, int devic
         return NULL;
 
     int ndev = 0;
-    if( cudaGetDeviceCount( &ndev ) != cudaSuccess || ndev <= 0 )
+    cudaError_t ce = cudaGetDeviceCount( &ndev );
+    if( ce != cudaSuccess || ndev <= 0 )
         return NULL;
     if( device < 0 || device >= ndev )
         device = 0;
-    if( cudaSetDevice( device ) != cudaSuccess )
+    ce = cudaSetDevice( device );
+    if( ce != cudaSuccess )
+        return NULL;
+
+    if( !gpu_drv_load() )
         return NULL;
 
     cudaDeviceProp prop;
+    memset( &prop, 0, sizeof(prop) );
     if( cudaGetDeviceProperties( &prop, device ) == cudaSuccess )
         snprintf( gpu_name, sizeof(gpu_name), "%s (sm_%d%d)", prop.name,
                   prop.major, prop.minor );
 
+    /* Retain the primary context explicitly instead of trusting whatever the
+     * runtime left current: some cudart versions expose a destroyed handle
+     * after their device queries, and the driver API needs a live current
+     * context.  cudart shares the same primary context, so this only adds a
+     * reference. */
+    CUcontext cu_ctx = NULL;
+    CUdevice  cu_dev = 0;
+    int cu_retained = 0;
+    if( g_drv.cuDeviceGet( &cu_dev, device ) != CUDA_SUCCESS ||
+        g_drv.cuDevicePrimaryCtxRetain( &cu_ctx, cu_dev ) != CUDA_SUCCESS ||
+        g_drv.cuCtxSetCurrent( cu_ctx ) != CUDA_SUCCESS )
+    {
+        fprintf( stderr, "x264 CUDA ME: cannot establish a CUDA context (device %d)\n", device );
+        return NULL;
+    }
+    cu_retained = 1;
+
     x264_gpu_ctx_t *c = new (std::nothrow) x264_gpu_ctx_t();
     if( !c )
+    {
+        if( cu_retained )
+            g_drv.cuDevicePrimaryCtxRelease( cu_dev );
         return NULL;
+    }
     c->w = width;
     c->h = height;
     c->lw = (width + 3) / 4;
@@ -290,10 +300,73 @@ extern "C" void *x264_gpu_create( int width, int height, int max_refs, int devic
     c->max_refs = max_refs < 1 ? 1 : (max_refs > X264_GPU_MAX_REFS ? X264_GPU_MAX_REFS : max_refs);
     c->device = device;
     c->disabled = 0;
+    c->cu_ctx = cu_ctx;
+    c->cu_dev = cu_dev;
+    c->cu_retained = cu_retained;
     c->timing = getenv( "X264_GPU_TIMING" ) != NULL;
     c->prof = getenv( "X264_GPU_PROF" ) != NULL;
     if( c->timing )
         printf( "x264 CUDA ME timing: %dx%d, %d refs, device %d\n", width, height, c->max_refs, device );
+
+    /* Pick and load the kernel image.  cc >= 10 (Blackwell and newer) uses
+     * the image built by the modern toolkit, everything else the CUDA 11.8
+     * image; both carry a PTX fallback for unknown devices. */
+    {
+        static const int ids[2] = { GPU_RES_LEGACY, GPU_RES_MODERN };
+        int first = prop.major >= 10 ? 1 : 0;
+        int ntry = 2;
+        int order[2];
+        order[0] = ids[first];
+        order[1] = ids[1-first];
+        const char *force = getenv( "X264_GPU_FATBIN" );   /* test hook */
+        if( force )
+        {
+            if( !strcmp( force, "legacy" ) )
+                order[0] = GPU_RES_LEGACY;
+            else if( !strcmp( force, "modern" ) )
+                order[0] = GPU_RES_MODERN;
+            ntry = 1;   /* forced: keep the outcome observable */
+        }
+        for( int i = 0; i < ntry && !c->module; i++ )
+        {
+            size_t bsz = 0;
+            const void *blob = gpu_res_blob( order[i], &bsz );
+            if( !blob )
+                continue;
+            if( g_drv.cuModuleLoadData( &c->module, blob ) == CUDA_SUCCESS )
+            {
+                if( force )
+                    fprintf( stderr, "x264 CUDA ME: using %s kernel image\n",
+                             order[i] == GPU_RES_LEGACY ? "legacy (CUDA 11.8)"
+                                                        : "modern (CUDA 13.x)" );
+            }
+            else
+                c->module = NULL;
+        }
+    }
+    int look_fail = 0;
+    if( c->module )
+    {
+        if( g_drv.cuModuleGetFunction( &c->fn_ds, c->module, "downsample4" ) != CUDA_SUCCESS ||
+            g_drv.cuModuleGetFunction( &c->fn_coarse, c->module, "coarse_search" ) != CUDA_SUCCESS ||
+            g_drv.cuModuleGetFunction( &c->fn_refine, c->module, "refine_search" ) != CUDA_SUCCESS )
+        {
+            fprintf( stderr, "x264 CUDA ME: kernel entry points missing from the image\n" );
+            look_fail = 1;
+        }
+    }
+    else
+        fprintf( stderr, "x264 CUDA ME: no kernel image for this device (sm_%d%d)\n",
+                 prop.major, prop.minor );
+    if( !c->module || look_fail )
+    {
+        if( c->module )
+            g_drv.cuModuleUnload( c->module );
+        if( cu_retained )
+            g_drv.cuDevicePrimaryCtxRelease( cu_dev );
+        delete c;
+        return NULL;
+    }
 
     size_t fsz = (size_t)width * height;
     size_t lsz = (size_t)c->lw * c->lh;
@@ -304,24 +377,34 @@ extern "C" void *x264_gpu_create( int width, int height, int max_refs, int devic
         cudaMalloc( (void**)&c->d_cur_low, lsz ) != cudaSuccess ||
         cudaMalloc( (void**)&c->d_coarse, csz ) != cudaSuccess ||
         cudaMalloc( (void**)&c->d_out, csz ) != cudaSuccess ||
-        cudaMallocHost( (void**)&c->h_ref, fsz ) != cudaSuccess ||
         cudaMallocHost( (void**)&c->h_out, 2 * X264_GPU_MAX_REFS * csz ) != cudaSuccess )
         fail = 1;
+    for( int i = 0; i < X264_GPU_STAGE && !fail; i++ )
+    {
+        if( cudaMallocHost( (void**)&c->h_ref[i], fsz ) != cudaSuccess ||
+            cudaEventCreateWithFlags( &c->stage_done[i], cudaEventDisableTiming ) != cudaSuccess )
+            fail = 1;
+        else
+            cudaEventRecord( c->stage_done[i], c->stream );   /* start "done" */
+    }
     for( int i = 0; i < X264_GPU_CACHE && !fail; i++ )
         if( cudaMalloc( (void**)&c->cache[i].full, fsz ) != cudaSuccess ||
             cudaMalloc( (void**)&c->cache[i].low, lsz ) != cudaSuccess )
             fail = 1;
     if( !fail )
     {
-        /* Probe launch: verify that this device can actually run the kernels.
-         * The fat binary carries SASS for several architectures plus a
-         * forward-compatible PTX image, so an older GPU (or a broken driver)
-         * fails here and the dispatcher can fall back to another backend. */
-        downsample4<<<1, 1, 0, c->stream>>>( (uint8_t*)c->d_cur, 16, 16,
-                                             (uint8_t*)c->d_cur_low, 4, 4 );
-        if( cudaStreamSynchronize( c->stream ) != cudaSuccess )
+        /* Probe launch: verify that the loaded image can actually run on this
+         * device (unsupported architecture, broken driver, ...).  On failure
+         * this backend is rejected and the dispatcher can fall back. */
+        const uint8_t *a_src = c->d_cur;   int a_sw = 16, a_sh = 16;
+        uint8_t *a_dst = c->d_cur_low;     int a_dw = 4, a_dh = 4;
+        void *args[] = { &a_src, &a_sw, &a_sh, &a_dst, &a_dw, &a_dh };
+        if( gpu_launch( c, c->fn_ds, dim3( 1 ), dim3( 1 ), args ) < 0 ||
+            cudaStreamSynchronize( c->stream ) != cudaSuccess )
         {
-            cudaGetLastError();   /* clear the sticky error */
+            cudaError_t pe = cudaGetLastError();   /* clear the sticky error */
+            fprintf( stderr, "x264 CUDA ME: kernel launch failed on this device (%d: %s)\n",
+                     (int)pe, cudaGetErrorString( pe ) );
             fail = 1;
         }
     }
@@ -332,13 +415,19 @@ extern "C" void *x264_gpu_create( int width, int height, int max_refs, int devic
         if( c->d_cur_low ) cudaFree( c->d_cur_low );
         if( c->d_coarse ) cudaFree( c->d_coarse );
         if( c->d_out ) cudaFree( c->d_out );
-        if( c->h_ref ) cudaFreeHost( c->h_ref );
+        for( int i = 0; i < X264_GPU_STAGE; i++ )
+        {
+            if( c->h_ref[i] ) cudaFreeHost( c->h_ref[i] );
+            if( c->stage_done[i] ) cudaEventDestroy( c->stage_done[i] );
+        }
         if( c->h_out ) cudaFreeHost( c->h_out );
         for( int i = 0; i < X264_GPU_CACHE; i++ )
         {
             if( c->cache[i].full ) cudaFree( c->cache[i].full );
             if( c->cache[i].low ) cudaFree( c->cache[i].low );
         }
+        if( c->module ) g_drv.cuModuleUnload( c->module );
+        if( cu_retained ) g_drv.cuDevicePrimaryCtxRelease( cu_dev );
         delete c;
         return NULL;
     }
@@ -375,13 +464,19 @@ extern "C" void x264_gpu_destroy( void *ctx )
     if( c->d_cur_low ) cudaFree( c->d_cur_low );
     if( c->d_coarse ) cudaFree( c->d_coarse );
     if( c->d_out ) cudaFree( c->d_out );
-    if( c->h_ref ) cudaFreeHost( c->h_ref );
+    for( int i = 0; i < X264_GPU_STAGE; i++ )
+    {
+        if( c->h_ref[i] ) cudaFreeHost( c->h_ref[i] );
+        if( c->stage_done[i] ) cudaEventDestroy( c->stage_done[i] );
+    }
     if( c->h_out ) cudaFreeHost( c->h_out );
     for( int i = 0; i < X264_GPU_CACHE; i++ )
     {
         if( c->cache[i].full ) cudaFree( c->cache[i].full );
         if( c->cache[i].low ) cudaFree( c->cache[i].low );
     }
+    if( c->module ) g_drv.cuModuleUnload( c->module );
+    if( c->cu_retained ) g_drv.cuDevicePrimaryCtxRelease( c->cu_dev );
     delete c;
 }
 
@@ -445,21 +540,30 @@ static int upload_plane( cudaStream_t st, uint8_t *dst, const uint8_t *src,
                               cudaMemcpyHostToDevice, st ) == cudaSuccess ? 0 : -1;
 }
 
-/* Upload through a pinned staging buffer: pageable sources would make the
+/* Upload through the pinned staging ring: pageable sources would make the
  * asynchronous copy synchronise the stream, which serialises the whole
- * analysis onto the calling thread. */
-static int upload_plane_pinned( cudaStream_t st, uint8_t *dst, const uint8_t *src,
-                                int stride, int width, int height, uint8_t *stage )
+ * analysis onto the calling thread.  Each buffer is reused only after the
+ * copy that last read it has completed (see the ring comment). */
+static int upload_plane_pinned( x264_gpu_ctx_t *c, uint8_t *dst, const uint8_t *src,
+                                int stride, int width, int height )
 {
-    if( !src || !stage || stride < width )
+    if( !src || stride < width )
         return -1;
+    int slot = c->stage_next++ % X264_GPU_STAGE;
+    if( cudaEventQuery( c->stage_done[slot] ) == cudaErrorNotReady )
+        cudaEventSynchronize( c->stage_done[slot] );
+    uint8_t *stage = c->h_ref[slot];
     if( stride == width )
         memcpy( stage, src, (size_t)width * height );
     else
         for( int y = 0; y < height; y++ )
             memcpy( stage + (size_t)y * width, src + (size_t)y * stride, width );
-    return cudaMemcpyAsync( dst, stage, (size_t)width * height,
-                            cudaMemcpyHostToDevice, st ) == cudaSuccess ? 0 : -1;
+    if( cudaMemcpyAsync( dst, stage, (size_t)width * height,
+                         cudaMemcpyHostToDevice, c->stream ) != cudaSuccess )
+        return -1;
+    if( cudaEventRecord( c->stage_done[slot], c->stream ) != cudaSuccess )
+        return -1;
+    return 0;
 }
 
 /* Copy the staged candidates into the frame after the stream has been
@@ -535,8 +639,13 @@ static int gpu_analyze_common( void *ctx, x264_gpu_frame_t *frame,
     if( upload_plane( c->stream, c->d_cur, cur, cur_stride, c->w, c->h ) < 0 )
         goto fail;
     TIM_MARK( t_upload_cur );
-    downsample4<<<grd, blk, 0, c->stream>>>( c->d_cur, c->w, c->h,
-                                             c->d_cur_low, lw, lh );
+    {
+        const uint8_t *a_src = c->d_cur;   int a_sw = c->w, a_sh = c->h;
+        uint8_t *a_dst = c->d_cur_low;     int a_dw = lw, a_dh = lh;
+        void *args[] = { &a_src, &a_sw, &a_sh, &a_dst, &a_dw, &a_dh };
+        if( gpu_launch( c, c->fn_ds, grd, blk, args ) < 0 )
+            goto fail;
+    }
     TIM_MARK( t_down );
 
     for( int list = 0; list < 2; list++ )
@@ -568,22 +677,44 @@ static int gpu_analyze_common( void *ctx, x264_gpu_frame_t *frame,
                 int slot = c->cache_next++ % X264_GPU_CACHE;
                 d_ref = c->cache[slot].full;
                 d_ref_low = c->cache[slot].low;
-                if( upload_plane_pinned( c->stream, d_ref, refs[r], strides[r], c->w, c->h, c->h_ref ) < 0 )
+                if( upload_plane_pinned( c, d_ref, refs[r], strides[r], c->w, c->h ) < 0 )
                     goto fail;
                 TIM_MARK( t_upload_ref );
-                downsample4<<<grd, blk, 0, c->stream>>>( d_ref, c->w, c->h,
-                                                         d_ref_low, lw, lh );
+                {
+                    const uint8_t *a_src = d_ref;   int a_sw = c->w, a_sh = c->h;
+                    uint8_t *a_dst = d_ref_low;     int a_dw = lw, a_dh = lh;
+                    void *args[] = { &a_src, &a_sw, &a_sh, &a_dst, &a_dw, &a_dh };
+                    if( gpu_launch( c, c->fn_ds, grd, blk, args ) < 0 )
+                        goto fail;
+                }
                 TIM_MARK( t_down );
                 c->cache[slot].ptr = refs[r];
                 c->cache[slot].id = ids[r];
             }
-            coarse_search<<<(mbcount + threads - 1) / threads, threads, 0, c->stream>>>(
-                c->d_cur_low, lw, lh, d_ref_low, lw, lh,
-                c->mbw, c->mbh, range, c->d_coarse );
+            {
+                const uint8_t *a_cur = c->d_cur_low; int a_cw = lw, a_ch = lh;
+                const uint8_t *a_ref = d_ref_low;    int a_rw = lw, a_rh = lh;
+                int a_mbw = c->mbw, a_mbh = c->mbh, a_range = range;
+                Cand *a_out = c->d_coarse;
+                void *args[] = { &a_cur, &a_cw, &a_ch, &a_ref, &a_rw, &a_rh,
+                                 &a_mbw, &a_mbh, &a_range, &a_out };
+                if( gpu_launch( c, c->fn_coarse, dim3( (mbcount + threads - 1) / threads ),
+                                dim3( threads ), args ) < 0 )
+                    goto fail;
+            }
             TIM_MARK( t_coarse );
-            refine_search<<<(total + threads - 1) / threads, threads, 0, c->stream>>>(
-                c->d_cur, c->w, c->h, d_ref, c->w, c->h,
-                c->mbw, c->mbh, radius, c->d_coarse, c->d_out );
+            {
+                const uint8_t *a_cur = c->d_cur; int a_cw = c->w, a_ch = c->h;
+                const uint8_t *a_ref = d_ref;    int a_rw = c->w, a_rh = c->h;
+                int a_mbw = c->mbw, a_mbh = c->mbh, a_radius = radius;
+                const Cand *a_coarse = c->d_coarse;
+                Cand *a_out = c->d_out;
+                void *args[] = { &a_cur, &a_cw, &a_ch, &a_ref, &a_rw, &a_rh,
+                                 &a_mbw, &a_mbh, &a_radius, &a_coarse, &a_out };
+                if( gpu_launch( c, c->fn_refine, dim3( (total + threads - 1) / threads ),
+                                dim3( threads ), args ) < 0 )
+                    goto fail;
+            }
             TIM_MARK( t_refine );
             /* Stage the D2H through pinned memory: writing directly into the
              * frame's pageable candidate buffer would synchronise the stream

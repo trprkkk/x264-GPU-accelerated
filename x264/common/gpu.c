@@ -2,8 +2,9 @@
  * gpu.c: dispatcher for the GPU candidate generator
  *****************************************************************************
  * The public API declared in gpu.h is implemented here by forwarding to the
- * selected backend: CUDA (gpu.cu) or OpenCL (gpu_cl.c).  Frames start with a
- * backend header so lookups can be routed without extra state.
+ * selected backend: CUDA (gpu_cuda.cpp with the kernels in gpu_kernels.cu) or
+ * OpenCL (gpu_cl.c).  Frames start with a backend header so lookups can be
+ * routed without extra state.
  *
  * When an analysis fails at runtime, x264_gpu_fallback() retires the failing
  * backend (kept alive so that frames still holding its candidate buffers can

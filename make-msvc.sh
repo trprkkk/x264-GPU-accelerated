@@ -14,7 +14,10 @@ if [ -d /c/MinGW/bin ]; then
     export PATH="/c/MinGW/bin:$PATH"
 fi
 
-export CUDA_ROOT="${CUDA_ROOT:-C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3}"
+export CUDA_ROOT="${CUDA_ROOT:-C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8}"
 export LIB="${CUDA_ROOT}/lib/x64;${LIB}"
+# The CUDA headers must be searched *after* the system headers: the toolkit
+# ships its own stdint.h, which would otherwise shadow the compiler's.
+export INCLUDE="${INCLUDE};${CUDA_ROOT}/include"
 cd "$ROOT/build-msvc"
 mingw32-make -j8 "$@"

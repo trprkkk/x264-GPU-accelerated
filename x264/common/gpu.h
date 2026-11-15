@@ -7,8 +7,8 @@
  * reference and remains the only authority on the output bitstream.
  *
  * common/gpu.c is the dispatcher for the public API below; the actual
- * implementations live in common/gpu.cu (CUDA) and common/gpu_cl.c (OpenCL)
- * and are selected with x264_gpu_create()'s backend argument.
+ * implementations live in common/gpu_cuda.cpp + common/gpu_kernels.cu (CUDA)
+ * and common/gpu_cl.c (OpenCL); selected by x264_gpu_create()'s backend argument.
  *****************************************************************************/
 
 #ifndef X264_GPU_H
@@ -74,7 +74,7 @@ typedef struct x264_gpu_backend_t
                               int list, const void *ref_plane, int64_t ref_id );
 } x264_gpu_backend_t;
 
-/* Backend instances (defined in gpu.cu / gpu_cl.c). */
+/* Backend instances (defined in gpu_cuda.cpp / gpu_cl.c). */
 extern const x264_gpu_backend_t x264_gpu_backend_cuda;
 extern const x264_gpu_backend_t x264_gpu_backend_cl;
 

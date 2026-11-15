@@ -1,0 +1,75 @@
+# Phase 6: CUDA for Kepler..Volta (CUDA 11.8 kernels + driver API) (2026-11-15)
+
+Supersedes `multiarch-fallback.txt` (which had Kepler..Volta on OpenCL only).
+
+## Why
+
+pre-Turing GeForce cards were left to the OpenCL backend because CUDA Toolkit
+13 cannot compile for them and its runtime refuses to initialise on the older
+drivers those GPUs are stuck with (Kepler's last driver is R470).  CUDA 11.8
+is the last toolkit that covers Kepler..Hopper and its runtime works on every
+driver from R451 up, so the backend now uses two toolkits' kernel images and
+loads them through the CUDA driver API.
+
+## What was built
+
+* **Kernel/host split.**  `common/gpu_kernels.cu` contains the kernels only and
+  is compiled with `nvcc -fatbin`; `common/gpu_cuda.cpp` is the host side and
+  is compiled by the regular C++ compiler.  This was mandatory: the VS 18
+  standard library refuses to be parsed by CUDA front ends older than 13.2
+  ("error STL1002"), and the host side must not go through nvcc 11.8 at all.
+* **Minimal stub header.**  `common/cuda_stub/cuda_runtime.h` is placed in
+  front of the CUDA include path for the kernel build, so only the
+  device-side declarations (crt/host_defines.h, device_launch_parameters.h)
+  are used; the kernels provide their own min/max.
+* **Two kernel images, loaded at runtime.**  CUDA 11.8 builds sm_35..sm_90 +
+  compute_75 PTX; CUDA 13.x builds sm_100/sm_120 + compute_90 PTX.  Both are
+  embedded as RCDATA resources (`gpu_res.o`) and loaded with
+  `cuModuleLoadData` from a dynamically loaded `nvcuda.dll`.  The device's
+  compute capability picks the image; the other one is tried as a fallback.
+  `X264_GPU_FATBIN=legacy|modern` forces one for testing.
+* **Host API stays cudart.**  Memory, streams, copies and events use cudart
+  11.8 (statically linked, minor-version-compatible with R451+ drivers);
+  only module loading and kernel launches go through the driver API.
+* **Context fix.**  cudart 11.8 can leave a *destroyed* handle current after
+  its device queries (`CUDA_ERROR_CONTEXT_IS_DESTROYED` from
+  `cuModuleLoadData`); the backend now retains the primary context explicitly
+  and makes it current instead of trusting `cuCtxGetCurrent`.
+* **Staging ring.**  Reference uploads now alternate between two pinned
+  staging buffers fenced with events: the previous single buffer could be
+  overwritten while its async copy was still reading it, which becomes
+  reachable on old (slow PCIe) machines where the copy can outlast the CPU
+  staging.
+* Build scripts: `configure-msvc.sh` writes `NVCC_LEGACY`/`NVCC_MODERN`,
+  `CUDAFLAGS_LEGACY`/`CUDAFLAGS_MODERN`; `make-msvc.sh` appends the CUDA
+  include directory to INCLUDE (appending keeps the toolkit's own stdint.h
+  from shadowing the compiler's).
+
+## Verification (RTX 2060 SUPER, driver 580.x, VS 18)
+
+| check | result |
+|---|---|
+| regression hashes | g0 `BEB55C36...`, m2 `965066A7...`, m3 `B3090B30...` all match |
+| m2 on the CUDA 11.8 kernels (default for sm_75) | `965066A7...` - the 11.8 codegen is bit-identical |
+| A/B vs released v1.0.0 (13.3 kernels, runtime API) | 6/6 bit-identical (720p m1/m4/medium m2, 1080p medium m2 / placebo m2/m3) |
+| `X264_GPU_FATBIN=legacy` | loads the 11.8 image, same hash |
+| `X264_GPU_FATBIN=modern` (no sm_75 image) | `CUDA_ERROR_NO_BINARY_FOR_GPU`, auto-falls back to OpenCL, same hash |
+| CUDA == OpenCL (720p m2) | `965066A7...` == `965066A7...` |
+| fallback E2E (4 directions, `X264_GPU_SIMULATE_FAIL`) | one switch, output unchanged |
+| `selftest.ps1` | 27/27 PASS |
+| determinism battery | mode 1/2/3 repeats identical, mode 0 == stock, frame types identical |
+| imports (`dumpbin /dependents`) | SHELL32.dll / KERNEL32.dll only (nvcuda.dll is dynamic) |
+| speed (placebo esa24 m2, 120 f, 4 alternating runs) | 51.16 s vs 51.59 s for v1.0.0 (-0.8 %, within noise) |
+
+Binary: `x264.exe`, 3,167,744 bytes, SHA256
+`3DF63A7B8851C7D826585D1BAF104A894500701296752A3F8FCDC49631C340BC`
+(released as v1.0.1).
+
+## Notes
+
+* CUDA 11.8's ptxas produces the sm_35..sm_90 images; sm_100/sm_120 stay with
+  the modern toolkit so Blackwell keeps native code (no JIT).
+* Kepler..Volta execution could not be tested on real hardware here; the
+  kernels are the same source that is verified bit-exact on sm_75, and the
+  OpenCL backend remains as a fallback if a driver rejects the image.
+* The build now requires both toolkits (11.8 and a 12.8+/13.x), see README.

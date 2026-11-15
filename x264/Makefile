@@ -269,15 +269,32 @@ endif
 endif
 
 ifeq ($(HAVE_CUDA),1)
+# The CUDA backend is split in two: the kernels (gpu_kernels.cu) are compiled
+# to fat binaries by nvcc (CUDA 11.8 for sm_35..sm_90, a newer toolkit for
+# sm_100+) and embedded in the executable as RCDATA resources; the host side
+# (gpu_cuda.cpp) is built by the regular compiler, uses cudart and loads the
+# kernels through the driver API at runtime.  This decouples the kernel build
+# from the (much newer) host compiler and lets one binary serve Kepler..Blackwell.
 OBJCU = common/gpu.o common/gpu_cuda.o common/gpu_cl.o
 OBJS += $(OBJCU)
+OBJCLI += gpu_res.o
 LDFLAGSCLI += $(CUDALIBS)
 common/gpu.o: common/gpu.c $(SRCPATH)/common/gpu.h
 	$(CC) $(CFLAGS) -c $< $(CC_O)
-common/gpu_cuda.o: common/gpu.cu $(SRCPATH)/common/gpu.h
-	"$(NVCC)" $(CUDAFLAGS) -c $< -o $@
+common/gpu_cuda.o: $(SRCPATH)/common/gpu_cuda.cpp $(SRCPATH)/common/gpu.h $(SRCPATH)/common/gpu_kernels.h
+	$(CC) $(CFLAGS) -c $< $(CC_O)
 common/gpu_cl.o: common/gpu_cl.c $(SRCPATH)/common/gpu.h
 	$(CC) $(CFLAGS) $(OPENCL_INC) -c $< $(CC_O)
+gpu_fatbin_legacy.bin: $(SRCPATH)/common/gpu_kernels.cu $(SRCPATH)/common/gpu_kernels.h $(SRCPATH)/common/cuda_stub/cuda_runtime.h
+	"$(NVCC_LEGACY)" $(CUDAFLAGS_LEGACY) -fatbin $< -o $@
+gpu_fatbin_modern.bin: $(SRCPATH)/common/gpu_kernels.cu $(SRCPATH)/common/gpu_kernels.h $(SRCPATH)/common/cuda_stub/cuda_runtime.h
+	"$(NVCC_MODERN)" $(CUDAFLAGS_MODERN) -fatbin $< -o $@
+gpu_res.rc: gpu_fatbin_legacy.bin gpu_fatbin_modern.bin
+	@printf '101 RCDATA "gpu_fatbin_legacy.bin"\r\n' > $@
+	@printf '102 RCDATA "gpu_fatbin_modern.bin"\r\n' >> $@
+gpu_res.o: gpu_res.rc
+	$(RC) $(RCFLAGS)$@ $<
+GENERATED += gpu_fatbin_legacy.bin gpu_fatbin_modern.bin gpu_res.rc
 endif
 
 ifeq ($(HAVE_OPENCL),yes)

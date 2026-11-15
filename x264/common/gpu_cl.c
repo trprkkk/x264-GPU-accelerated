@@ -1,13 +1,13 @@
 /*****************************************************************************
  * gpu_cl.c: OpenCL backend for the GPU candidate generator
  *****************************************************************************
- * Same algorithm and same public behaviour as the CUDA backend in gpu.cu:
- * a quarter-resolution coarse search followed by a full-resolution refinement
- * returns up to X264_GPU_CANDS integer-pel candidates per macroblock and
- * reference.  The candidates are matched by reference identity (plane
- * pointer + i_frame) and published only after the queue has been finished,
- * so the async prefetch publishes exactly the same data as the synchronous
- * path.
+ * Same algorithm and public behaviour as the CUDA backend (gpu_cuda.cpp with
+ * the kernels in gpu_kernels.cu): a quarter-resolution coarse search followed
+ * by a full-resolution refinement returns up to X264_GPU_CANDS integer-pel
+ * candidates per macroblock and reference.  The candidates are matched by
+ * reference identity (plane pointer + i_frame) and published only after the
+ * queue has been finished, so the async prefetch publishes exactly the same
+ * data as the synchronous path.
  *
  * The command queue is only touched from the encoder's API thread (the
  * asynchronous prefetch is restricted to single-threaded encoding, see
@@ -220,8 +220,9 @@ struct gpu_cl_ctx_t
 
 static char gpu_cl_name[256] = "OpenCL device";
 
-/* The kernels mirror gpu.cu line for line (same iteration order and strict
- * comparisons), so both backends produce the same candidates. */
+/* The kernels mirror the CUDA kernels (gpu_kernels.cu) line for line (same
+ * iteration order and strict comparisons), so both backends produce the same
+ * candidates. */
 static const char *gpu_cl_source =
 "typedef struct { short2 mv; uint sad; } Cand;\n"
 "#define GK 4\n"

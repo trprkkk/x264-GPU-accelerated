@@ -1,5 +1,9 @@
 # Phase 5: Multi-architecture CUDA + OpenCL fallback (2026-11-15)
 
+> Superseded for pre-Turing GPUs by `cuda-legacy-gpus.txt` (v1.0.1): the CUDA
+> backend now also covers Kepler..Volta with CUDA 11.8 kernels loaded through
+> the driver API.  This file records the v1.0.0 state.
+
 ## Why
 
 The released binary carried a single `sm_75` (Turing) SASS image, so any newer
