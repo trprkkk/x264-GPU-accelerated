@@ -49,20 +49,20 @@ typedef struct x264_gpu_backend_t
     int id;              /* X264_GPU_BACKEND_* */
     const char *name_id; /* "cuda" / "opencl" */
     int      (*available)( void );
-    void *   (*create)( int width, int height, int max_refs, int device );
+    void *   (*create)( int width, int height, int max_refs, int device, int bit_depth );
     void     (*destroy)( void *ctx );
     const char *(*name)( void );
     x264_gpu_frame_t *(*frame_alloc)( int mbw, int mbh, int nref0, int nref1 );
     void     (*frame_free)( x264_gpu_frame_t *frame );
     int      (*analyze)( void *ctx, x264_gpu_frame_t *frame,
-                         const uint8_t *cur, int cur_stride,
-                         uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
-                         uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
+                         const void *cur, int cur_stride,
+                         void *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
+                         void *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
                          int range, int radius );
     int      (*analyze_async)( void *ctx, x264_gpu_frame_t *frame,
-                               const uint8_t *cur, int cur_stride,
-                               uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
-                               uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
+                               const void *cur, int cur_stride,
+                               void *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
+                               void *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
                                int range, int radius );
     int      (*finish)( void *ctx );
     int      (*is_pending)( void *ctx, const x264_gpu_frame_t *frame );
@@ -79,8 +79,9 @@ extern const x264_gpu_backend_t x264_gpu_backend_cuda;
 extern const x264_gpu_backend_t x264_gpu_backend_cl;
 
 /* Create a candidate generator on the requested backend (0 = auto).
+ * bit_depth is the encoder's pixel depth (8, or 10 with two-byte pixels).
  * Returns NULL when the selected backend is unavailable or init fails. */
-void *x264_gpu_create( int width, int height, int max_refs, int device, int backend );
+void *x264_gpu_create( int width, int height, int max_refs, int device, int backend, int bit_depth );
 void  x264_gpu_destroy( void *ctx );
 /* After an analysis failure, try to continue on the other backend (retires
  * the failing backend; at most one switch).  Returns 0 on success.  The
@@ -95,13 +96,15 @@ x264_gpu_frame_t *x264_gpu_frame_alloc( void *ctx, int mbw, int mbh, int nref0, 
 void              x264_gpu_frame_free( x264_gpu_frame_t *frame );
 
 /* Upload the current picture and the references, run the coarse-to-fine
- * search, and fill the frame's candidate arrays.  ref_ids are opaque keys
- * (identifying the reference content together with the plane pointer) used
- * to cache reference planes on the device.  Returns 0 on success. */
+ * search, and fill the frame's candidate arrays.  The planes are in the
+ * encoder's pixel format (8-bit or two-byte high-depth pixels) and the
+ * strides are in pixels.  ref_ids are opaque keys (identifying the reference
+ * content together with the plane pointer) used to cache reference planes on
+ * the device.  Returns 0 on success. */
 int x264_gpu_analyze( void *ctx, x264_gpu_frame_t *frame,
-                      const uint8_t *cur, int cur_stride,
-                      uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
-                      uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
+                      const void *cur, int cur_stride,
+                      void *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
+                      void *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
                       int range, int radius );
 
 /* Asynchronous (prefetch) variant of x264_gpu_analyze: launches the same work
@@ -109,9 +112,9 @@ int x264_gpu_analyze( void *ctx, x264_gpu_frame_t *frame,
  * only after x264_gpu_finish(), which also refuses to publish work whose
  * references no longer match.  At most one analysis may be in flight. */
 int x264_gpu_analyze_async( void *ctx, x264_gpu_frame_t *frame,
-                            const uint8_t *cur, int cur_stride,
-                            uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
-                            uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
+                            const void *cur, int cur_stride,
+                            void *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
+                            void *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
                             int range, int radius );
 
 /* Wait for an in-flight analysis and publish its results (nfilled).  Returns
@@ -125,8 +128,8 @@ int x264_gpu_pending_any( void *ctx );
 /* Candidate lookup used by me.c.  The reference is identified by the
  * reference frame's luma plane pointer and its i_frame, so candidates remain
  * usable even when the analysis was launched for a predicted reference set.
- * Returns NULL when this list/reference/MB has no candidates (10-bit encode,
- * unsupported size, reference not analysed, ...). */
+ * Returns NULL when this list/reference/MB has no candidates (unsupported
+ * size, reference not analysed, ...). */
 const x264_gpu_cand_t *x264_gpu_frame_get( const x264_gpu_frame_t *frame,
                                            int list, const void *ref_plane, int64_t ref_id,
                                            int mbx, int mby, int *count );
@@ -134,6 +137,62 @@ const x264_gpu_cand_t *x264_gpu_frame_get( const x264_gpu_frame_t *frame,
 /* 1 when a candidate slot for (list, ref_plane, ref_id) exists. */
 int x264_gpu_frame_covers( const x264_gpu_frame_t *frame,
                            int list, const void *ref_plane, int64_t ref_id );
+
+/* ---------------- lookahead (lowres) acceleration -------------------------
+ * A second, smaller context that accelerates the slicetype lookahead's
+ * lowres analysis.  Two operating modes:
+ *   exact (1): the GPU precomputes exactly the values the CPU path would
+ *              compute (raw intra costs and exhaustive fpel SAD tables), so
+ *              the CPU lookahead keeps making identical decisions and the
+ *              output stays bit-identical to the CPU lookahead.  Any GPU
+ *              failure degrades to the CPU computing those values itself,
+ *              which is still exact.
+ *   fast  (2): the GPU also makes the motion decisions; the output may
+ *              differ from the CPU lookahead (like the stock --opencl
+ *              lookahead), but stays deterministic.                     */
+
+typedef struct x264_gpu_la_backend_t
+{
+    int id;              /* X264_GPU_BACKEND_* */
+    const char *name_id; /* "cuda" / "opencl" */
+    int      (*available)( void );
+    void *   (*create)( int mbw, int mbh, int device, int bit_depth );
+    void     (*destroy)( void *ctx );
+    const char *(*name)( void );
+    /* Fill out[i_mb_xy] with the RAW lookahead intra cost of every MB (the
+     * minimum predictor SATD/SAD of the 8x8 lowres block, before the depth
+     * shift and penalty the CPU applies).  base is the padded plane storage,
+     * base_off the offset of the plane origin from it in pixels, stride the
+     * full padded stride in pixels and rows the number of rows to upload
+     * from base (covering the origin row and everything the kernels read). */
+    int      (*intra)( void *ctx, const void *base, int base_off, int stride, int rows,
+                       int b_satd, int *out );
+    /* Fill out[(mb*(2R+1) + (dy+R))*(2R+1) + (dx+R)] with the 8x8 SAD (or
+     * SATD when b_satd is set, matching mbcmp_init's fpelcmp) between fenc's
+     * MB and the ref plane displaced by (dx,dy), for every MB and all
+     * |dx|,|dy| <= R.  Returns the host buffer holding the table, or NULL on
+     * failure.  The buffer stays valid until the next table call on the same
+     * context slot. */
+    uint16_t *(*table)( void *ctx, const void *fenc_base, int fenc_off, int fenc_stride,
+                        const void *ref_base, int ref_off, int ref_stride, int rows, int R,
+                        int b_satd );
+} x264_gpu_la_backend_t;
+
+/* Backend instances (defined in gpu_cuda.cpp / gpu_cl.c). */
+extern const x264_gpu_la_backend_t x264_gpu_la_backend_cuda;
+extern const x264_gpu_la_backend_t x264_gpu_la_backend_cl;
+
+void *x264_gpu_la_create( int mbw, int mbh, int device, int backend, int bit_depth );
+void  x264_gpu_la_destroy( void *ctx );
+const char *x264_gpu_la_name( void *ctx );
+const char *x264_gpu_la_backend_id( void *ctx );
+int   x264_gpu_la_intra( void *ctx, const void *base, int base_off, int stride, int rows,
+                         int b_satd, int *out );
+/* buf points into a small ring inside the context (cycled automatically);
+ * each returned buffer remains readable until the ring wraps. */
+uint16_t *x264_gpu_la_table( void *ctx, const void *fenc_base, int fenc_off, int fenc_stride,
+                             const void *ref_base, int ref_off, int ref_stride, int rows, int R,
+                             int b_satd );
 
 #ifdef __cplusplus
 }

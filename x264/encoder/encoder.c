@@ -1163,6 +1163,7 @@ static int validate_parameters( x264_t *h, int b_open )
     if( h->param.analyse.i_me_range > 16 && h->param.analyse.i_me_method <= X264_ME_HEX )
         h->param.analyse.i_me_range = 16;
     h->param.analyse.i_gpu_me = x264_clip3( h->param.analyse.i_gpu_me, 0, 4 );
+    h->param.analyse.i_gpu_la = x264_clip3( h->param.analyse.i_gpu_la, 0, 2 );
     h->param.analyse.i_gpu_me_range = x264_clip3( h->param.analyse.i_gpu_me_range, 4, 128 );
     h->param.analyse.i_gpu_me_radius = x264_clip3( h->param.analyse.i_gpu_me_radius, 0, 8 );
     h->param.analyse.i_gpu_me_refs = x264_clip3( h->param.analyse.i_gpu_me_refs, 0, 4 );
@@ -1762,7 +1763,6 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
 #endif
 
 #if HAVE_CUDA
-#if BIT_DEPTH == 8
     if( h->param.analyse.i_gpu_me && h->param.b_interlaced )
     {
         x264_log( h, X264_LOG_WARNING, "GPU ME: interlaced coding is not supported, falling back to CPU\n" );
@@ -1773,12 +1773,13 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
         /* The kernels work on whole macroblocks.  x264 allocates its frame
          * planes up to the macroblock grid and replicates the border there
          * (x264_frame_expand_border_mod16), so any frame size can be analysed
-         * by uploading the padded region. */
+         * by uploading the padded region.  8-bit and 10-bit (and higher)
+         * encodes are both supported. */
         int mbw = (h->param.i_width  + 15) >> 4;
         int mbh = (h->param.i_height + 15) >> 4;
         h->gpu_ctx = x264_gpu_create( mbw * 16, mbh * 16,
                                       X264_GPU_MAX_REFS, h->param.analyse.i_gpu_me_device,
-                                      h->param.analyse.i_gpu_me_backend );
+                                      h->param.analyse.i_gpu_me_backend, BIT_DEPTH );
         if( !h->gpu_ctx )
         {
             x264_log( h, X264_LOG_WARNING,
@@ -1786,16 +1787,37 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
             h->param.analyse.i_gpu_me = 0;
         }
         else
-            x264_log( h, X264_LOG_INFO, "GPU ME: %s / %s\n",
-                      x264_gpu_backend_id( h->gpu_ctx ), x264_gpu_name( h->gpu_ctx ) );
+            x264_log( h, X264_LOG_INFO, "GPU ME: %s / %s (%d-bit)\n",
+                      x264_gpu_backend_id( h->gpu_ctx ), x264_gpu_name( h->gpu_ctx ),
+                      BIT_DEPTH );
     }
-#else
-    if( h->param.analyse.i_gpu_me )
+    if( h->param.analyse.i_gpu_la == 2 )
     {
-        x264_log( h, X264_LOG_WARNING, "GPU ME: only supported in the 8-bit build, falling back to CPU\n" );
-        h->param.analyse.i_gpu_me = 0;
+        /* Fast mode (GPU makes the lookahead decisions) is not wired up yet. */
+        x264_log( h, X264_LOG_WARNING, "GPU lookahead: fast mode is not available yet, falling back to CPU\n" );
+        h->param.analyse.i_gpu_la = 0;
     }
-#endif
+    if( h->param.analyse.i_gpu_la && h->param.b_interlaced )
+    {
+        x264_log( h, X264_LOG_WARNING, "GPU lookahead: interlaced coding is not supported, falling back to CPU\n" );
+        h->param.analyse.i_gpu_la = 0;
+    }
+    if( h->param.analyse.i_gpu_la )
+    {
+        int mbw = (h->param.i_width  + 15) >> 4;
+        int mbh = (h->param.i_height + 15) >> 4;
+        h->gpu_la_ctx = x264_gpu_la_create( mbw, mbh, h->param.analyse.i_gpu_me_device,
+                                            h->param.analyse.i_gpu_me_backend, BIT_DEPTH );
+        if( !h->gpu_la_ctx )
+        {
+            x264_log( h, X264_LOG_WARNING, "GPU lookahead: no usable GPU backend, falling back to CPU\n" );
+            h->param.analyse.i_gpu_la = 0;
+        }
+        else
+            x264_log( h, X264_LOG_INFO, "GPU lookahead: %s / %s (exact mode, %d-bit)\n",
+                      x264_gpu_la_backend_id( h->gpu_la_ctx ), x264_gpu_la_name( h->gpu_la_ctx ),
+                      BIT_DEPTH );
+    }
 #endif
 
     h->thread[0] = h;
@@ -2455,7 +2477,7 @@ static inline void reference_build_list( x264_t *h, int i_poc )
     h->mb.pic.i_fref[1] = h->i_ref[1];
 }
 
-#if HAVE_CUDA && BIT_DEPTH == 8
+#if HAVE_CUDA
 /* 1 when the frame's published candidates cover the analysed part of the
  * current reference lists. */
 static int gpu_refs_covered( x264_t *h, int list, int nref )
@@ -2496,27 +2518,27 @@ static int gpu_me_analyse_sync( x264_t *h, int nref0, int nref1 )
     if( !h->fenc->gpu_me )
         return -2;
 
-    uint8_t *refs0[X264_GPU_MAX_REFS];
-    uint8_t *refs1[X264_GPU_MAX_REFS];
+    void *refs0[X264_GPU_MAX_REFS];
+    void *refs1[X264_GPU_MAX_REFS];
     int64_t ids0[X264_GPU_MAX_REFS];
     int64_t ids1[X264_GPU_MAX_REFS];
     int strides0[X264_GPU_MAX_REFS];
     int strides1[X264_GPU_MAX_REFS];
     for( int i = 0; i < nref0; i++ )
     {
-        refs0[i] = (uint8_t*)h->fref[0][i]->plane[0];
+        refs0[i] = h->fref[0][i]->plane[0];
         ids0[i] = h->fref[0][i]->i_frame;
         strides0[i] = h->fref[0][i]->i_stride[0];
     }
     for( int i = 0; i < nref1; i++ )
     {
-        refs1[i] = (uint8_t*)h->fref[1][i]->plane[0];
+        refs1[i] = h->fref[1][i]->plane[0];
         ids1[i] = h->fref[1][i]->i_frame;
         strides1[i] = h->fref[1][i]->i_stride[0];
     }
 
     return x264_gpu_analyze( h->gpu_ctx, (x264_gpu_frame_t*)h->fenc->gpu_me,
-                             (const uint8_t*)h->fenc->plane[0], h->fenc->i_stride[0],
+                             h->fenc->plane[0], h->fenc->i_stride[0],
                              refs0, ids0, strides0, nref0,
                              refs1, ids1, strides1, nref1,
                              h->param.analyse.i_gpu_me_range,
@@ -3801,7 +3823,7 @@ int     x264_encoder_encode( x264_t *h,
     }
     x264_ratecontrol_zone_init( h );
 
-#if HAVE_CUDA && BIT_DEPTH == 8
+#if HAVE_CUDA
     /* Complete a prefetched analysis before reference_update() can drop (and
      * free) frames that the asynchronous copies may still be reading. */
     if( h->gpu_ctx && x264_gpu_pending_any( h->gpu_ctx ) )
@@ -4535,8 +4557,9 @@ void    x264_encoder_close  ( x264_t *h )
     char buf[200];
 #if HAVE_CUDA
     /* The main encoder struct is freed together with thread[0] below, so the
-     * CUDA context has to be remembered before that. */
+     * CUDA contexts have to be remembered before that. */
     void *gpu_ctx = h->gpu_ctx;
+    void *gpu_la_ctx = h->gpu_la_ctx;
 #endif
     int b_print_pcm = h->stat.i_mb_count[SLICE_TYPE_I][I_PCM]
                    || h->stat.i_mb_count[SLICE_TYPE_P][I_PCM]
@@ -4913,6 +4936,7 @@ void    x264_encoder_close  ( x264_t *h )
     }
 #if HAVE_CUDA
     x264_gpu_destroy( gpu_ctx );
+    x264_gpu_la_destroy( gpu_la_ctx );
 #endif
     x264_me_prof_print();
 #if HAVE_OPENCL

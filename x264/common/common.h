@@ -759,6 +759,7 @@ struct x264_t
 
 #if HAVE_CUDA
     void *gpu_ctx; /* x264_gpu_ctx_t, created by x264_encoder_open */
+    void *gpu_la_ctx; /* lookahead accelerator (lowres), same backends */
 #endif
 
 #if HAVE_OPENCL

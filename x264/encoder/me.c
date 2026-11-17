@@ -63,12 +63,21 @@ static void refine_subpel( x264_t *h, x264_me_t *m, int hpel_iters, int qpel_ite
 #define BITS_MVD( mx, my )\
     (p_cost_mvx[(mx)*4] + p_cost_mvy[(my)*4])
 
+/* GPU lookahead (exact mode): the fpel SAD from the precomputed square when
+ * the position is inside it, otherwise the ordinary CPU SAD.  Only active
+ * for the slicetype lowres search (i_list < 0); the encoder's own searches
+ * never see these fields set. */
+#define GPU_LA_SAD( mx, my ) \
+    ( m->i_list < 0 && m->la_tab && \
+      (unsigned)((mx) + m->la_R) < (unsigned)(2*m->la_R+1) && \
+      (unsigned)((my) + m->la_R) < (unsigned)(2*m->la_R+1) \
+        ? m->la_tab[m->la_mboff + ((my) + m->la_R) * (2*m->la_R+1) + ((mx) + m->la_R)] \
+        : h->pixf.fpelcmp[i_pixel]( p_fenc, FENC_STRIDE, &p_fref_w[(my)*stride+(mx)], stride ) )
+
 #define COST_MV( mx, my )\
 do\
 {\
-    int cost = h->pixf.fpelcmp[i_pixel]( p_fenc, FENC_STRIDE,\
-                   &p_fref_w[(my)*stride+(mx)], stride )\
-             + BITS_MVD(mx,my);\
+    int cost = GPU_LA_SAD( mx, my ) + BITS_MVD(mx,my);\
     COPY3_IF_LT( bcost, cost, bmx, mx, bmy, my );\
 } while( 0 )
 
@@ -83,12 +92,21 @@ do\
 
 #define COST_MV_X3_DIR( m0x, m0y, m1x, m1y, m2x, m2y, costs )\
 {\
-    pixel *pix_base = p_fref_w + bmx + bmy*stride;\
-    h->pixf.fpelcmp_x3[i_pixel]( p_fenc,\
-        pix_base + (m0x) + (m0y)*stride,\
-        pix_base + (m1x) + (m1y)*stride,\
-        pix_base + (m2x) + (m2y)*stride,\
-        stride, costs );\
+    if( m->i_list < 0 && m->la_tab )\
+    {\
+        (costs)[0] = GPU_LA_SAD( bmx+(m0x), bmy+(m0y) );\
+        (costs)[1] = GPU_LA_SAD( bmx+(m1x), bmy+(m1y) );\
+        (costs)[2] = GPU_LA_SAD( bmx+(m2x), bmy+(m2y) );\
+    }\
+    else\
+    {\
+        pixel *pix_base = p_fref_w + bmx + bmy*stride;\
+        h->pixf.fpelcmp_x3[i_pixel]( p_fenc,\
+            pix_base + (m0x) + (m0y)*stride,\
+            pix_base + (m1x) + (m1y)*stride,\
+            pix_base + (m2x) + (m2y)*stride,\
+            stride, costs );\
+    }\
     (costs)[0] += BITS_MVD( bmx+(m0x), bmy+(m0y) );\
     (costs)[1] += BITS_MVD( bmx+(m1x), bmy+(m1y) );\
     (costs)[2] += BITS_MVD( bmx+(m2x), bmy+(m2y) );\
@@ -96,13 +114,23 @@ do\
 
 #define COST_MV_X4_DIR( m0x, m0y, m1x, m1y, m2x, m2y, m3x, m3y, costs )\
 {\
-    pixel *pix_base = p_fref_w + bmx + bmy*stride;\
-    h->pixf.fpelcmp_x4[i_pixel]( p_fenc,\
-        pix_base + (m0x) + (m0y)*stride,\
-        pix_base + (m1x) + (m1y)*stride,\
-        pix_base + (m2x) + (m2y)*stride,\
-        pix_base + (m3x) + (m3y)*stride,\
-        stride, costs );\
+    if( m->i_list < 0 && m->la_tab )\
+    {\
+        (costs)[0] = GPU_LA_SAD( bmx+(m0x), bmy+(m0y) );\
+        (costs)[1] = GPU_LA_SAD( bmx+(m1x), bmy+(m1y) );\
+        (costs)[2] = GPU_LA_SAD( bmx+(m2x), bmy+(m2y) );\
+        (costs)[3] = GPU_LA_SAD( bmx+(m3x), bmy+(m3y) );\
+    }\
+    else\
+    {\
+        pixel *pix_base = p_fref_w + bmx + bmy*stride;\
+        h->pixf.fpelcmp_x4[i_pixel]( p_fenc,\
+            pix_base + (m0x) + (m0y)*stride,\
+            pix_base + (m1x) + (m1y)*stride,\
+            pix_base + (m2x) + (m2y)*stride,\
+            pix_base + (m3x) + (m3y)*stride,\
+            stride, costs );\
+    }\
     (costs)[0] += BITS_MVD( bmx+(m0x), bmy+(m0y) );\
     (costs)[1] += BITS_MVD( bmx+(m1x), bmy+(m1y) );\
     (costs)[2] += BITS_MVD( bmx+(m2x), bmy+(m2y) );\
@@ -111,13 +139,23 @@ do\
 
 #define COST_MV_X4( m0x, m0y, m1x, m1y, m2x, m2y, m3x, m3y )\
 {\
-    pixel *pix_base = p_fref_w + omx + omy*stride;\
-    h->pixf.fpelcmp_x4[i_pixel]( p_fenc,\
-        pix_base + (m0x) + (m0y)*stride,\
-        pix_base + (m1x) + (m1y)*stride,\
-        pix_base + (m2x) + (m2y)*stride,\
-        pix_base + (m3x) + (m3y)*stride,\
-        stride, costs );\
+    if( m->i_list < 0 && m->la_tab )\
+    {\
+        costs[0] = GPU_LA_SAD( omx+(m0x), omy+(m0y) );\
+        costs[1] = GPU_LA_SAD( omx+(m1x), omy+(m1y) );\
+        costs[2] = GPU_LA_SAD( omx+(m2x), omy+(m2y) );\
+        costs[3] = GPU_LA_SAD( omx+(m3x), omy+(m3y) );\
+    }\
+    else\
+    {\
+        pixel *pix_base = p_fref_w + omx + omy*stride;\
+        h->pixf.fpelcmp_x4[i_pixel]( p_fenc,\
+            pix_base + (m0x) + (m0y)*stride,\
+            pix_base + (m1x) + (m1y)*stride,\
+            pix_base + (m2x) + (m2y)*stride,\
+            pix_base + (m3x) + (m3y)*stride,\
+            stride, costs );\
+    }\
     costs[0] += BITS_MVD( omx+(m0x), omy+(m0y) );\
     costs[1] += BITS_MVD( omx+(m1x), omy+(m1y) );\
     costs[2] += BITS_MVD( omx+(m2x), omy+(m2y) );\
@@ -291,7 +329,7 @@ static void me_search_ref_internal( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], 
          * the predicted motion vector.
          *
          * Disclaimer: this is a post-hoc rationalization for why this hack works. */
-        bcost = h->pixf.fpelcmp[i_pixel]( p_fenc, FENC_STRIDE, &p_fref_w[bmy*stride+bmx], stride );
+        bcost = GPU_LA_SAD( bmx, bmy );
 
         if( i_mvc > 0 )
         {
@@ -306,7 +344,7 @@ static void me_search_ref_internal( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], 
                 {
                     int mx = mvc_temp[i+1][0];
                     int my = mvc_temp[i+1][1];
-                    cost = h->pixf.fpelcmp[i_pixel]( p_fenc, FENC_STRIDE, &p_fref_w[my*stride+mx], stride ) + BITS_MVD( mx, my );
+                    cost = GPU_LA_SAD( mx, my ) + BITS_MVD( mx, my );
                     COPY1_IF_LT( bcost, (cost << 4) + i );
                 } while( ++i <= valid_mvcs );
                 bmx = mvc_temp[(bcost&15)+1][0];
@@ -329,7 +367,7 @@ static void me_search_ref_internal( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], 
      *           local range around the candidates
      *   mode 3: seed every partition and skip the CPU fullpel search         */
     int b_gpu_fpel = 0;
-#if HAVE_CUDA && BIT_DEPTH == 8
+#if HAVE_CUDA
     int i_gpu_mode = h->param.analyse.i_gpu_me;
     /* m->i_list is set to 0/1 only for the encoder's full-resolution search;
      * the lookahead's lowres ME uses -1 and must not receive candidates. */

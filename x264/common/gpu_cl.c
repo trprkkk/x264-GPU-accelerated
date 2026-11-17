@@ -197,6 +197,10 @@ struct x264_gpu_frame_t
 struct gpu_cl_ctx_t
 {
     int w, h, lw, lh, mbw, mbh, max_refs, device;
+    int pxsz;              /* bytes per pixel: 1 (8-bit) or 2 (10-bit & higher) */
+    const char *ks_down;   /* kernel entry names for the configured depth */
+    const char *ks_coarse;
+    const char *ks_refine;
     cl_context cl_ctx;
     cl_command_queue queue;
     cl_program program;
@@ -347,6 +351,117 @@ static const char *gpu_cl_source =
 "            }\n"
 "        }\n"
 "    out[idx] = best;\n"
+"}\n"
+/* The *_10 kernels are the same algorithms on the two-byte pixels of the
+ * 10-bit (and higher) builds. */
+"inline uint sad4x4_10( __global const ushort *a, int as, __global const ushort *b, int bs )\n"
+"{\n"
+"    uint s = 0;\n"
+"    for( int j = 0; j < 4; j++ )\n"
+"        for( int i = 0; i < 4; i++ )\n"
+"        {\n"
+"            int d = (int)a[j*as+i] - (int)b[j*bs+i];\n"
+"            s += (uint)(d < 0 ? -d : d);\n"
+"        }\n"
+"    return s;\n"
+"}\n"
+"__kernel void downsample4_10( __global const ushort *src, int sw, int sh,\n"
+"                              __global ushort *dst, int dw, int dh )\n"
+"{\n"
+"    int x = get_global_id(0);\n"
+"    int y = get_global_id(1);\n"
+"    if( x >= dw || y >= dh )\n"
+"        return;\n"
+"    int sx = x * 4, sy = y * 4;\n"
+"    int sum = 0;\n"
+"    for( int j = 0; j < 4; j++ )\n"
+"        for( int i = 0; i < 4; i++ )\n"
+"        {\n"
+"            int px = min( sx + i, sw - 1 );\n"
+"            int py = min( sy + j, sh - 1 );\n"
+"            sum += src[py * sw + px];\n"
+"        }\n"
+"    dst[y * dw + x] = (ushort)((sum + 8) >> 4);\n"
+"}\n"
+"__kernel void coarse_search_10( __global const ushort *cur, int cw, int ch,\n"
+"                                __global const ushort *ref, int rw, int rh,\n"
+"                                int mbw, int mbh, int range, __global Cand *out )\n"
+"{\n"
+"    int mb = get_global_id(0);\n"
+"    if( mb >= mbw * mbh )\n"
+"        return;\n"
+"    int mx = mb % mbw, my = mb / mbw;\n"
+"    int bx = mx * 4, by = my * 4;\n"
+"    Cand best[GK];\n"
+"    for( int i = 0; i < GK; i++ )\n"
+"    {\n"
+"        best[i].mv = (short2)( 0, 0 );\n"
+"        best[i].sad = 0xFFFFFFFFu;\n"
+"    }\n"
+"    int r = range / 4;\n"
+"    if( r < 1 )\n"
+"        r = 1;\n"
+"    for( int dy = -r; dy <= r; dy += 2 )\n"
+"        for( int dx = -r; dx <= r; dx += 2 )\n"
+"        {\n"
+"            int x = max( 0, min( bx + dx, cw - 4 ) );\n"
+"            int y = max( 0, min( by + dy, ch - 4 ) );\n"
+"            uint sad = sad4x4_10( cur + by * cw + bx, cw, ref + y * rw + x, rw );\n"
+"            insert_topk( best, (x - bx) * 4, (y - by) * 4, sad );\n"
+"        }\n"
+"    int fx = bx + best[0].mv.x / 4;\n"
+"    int fy = by + best[0].mv.y / 4;\n"
+"    for( int dy = -1; dy <= 1; dy++ )\n"
+"        for( int dx = -1; dx <= 1; dx++ )\n"
+"        {\n"
+"            if( !dx && !dy )\n"
+"                continue;\n"
+"            int x = max( 0, min( fx + dx, cw - 4 ) );\n"
+"            int y = max( 0, min( fy + dy, ch - 4 ) );\n"
+"            uint sad = sad4x4_10( cur + by * cw + bx, cw, ref + y * rw + x, rw );\n"
+"            insert_topk( best, (x - bx) * 4, (y - by) * 4, sad );\n"
+"        }\n"
+"    for( int i = 0; i < GK; i++ )\n"
+"        out[mb * GK + i] = best[i];\n"
+"}\n"
+"__kernel void refine_search_10( __global const ushort *cur, int cw, int ch,\n"
+"                                __global const ushort *ref, int rw, int rh,\n"
+"                                int mbw, int mbh, int radius,\n"
+"                                __global const Cand *coarse, __global Cand *out )\n"
+"{\n"
+"    int idx = get_global_id(0);\n"
+"    int total = mbw * mbh * GK;\n"
+"    if( idx >= total )\n"
+"        return;\n"
+"    int mb = idx / GK;\n"
+"    int mx = mb % mbw, my = mb / mbw;\n"
+"    int bx = mx * 16, by = my * 16;\n"
+"    int cx = bx + coarse[idx].mv.x;\n"
+"    int cy = by + coarse[idx].mv.y;\n"
+"    __global const ushort *pc = cur + by * cw + bx;\n"
+"    Cand best;\n"
+"    best.mv = (short2)( 0, 0 );\n"
+"    best.sad = 0xFFFFFFFFu;\n"
+"    for( int dy = -radius; dy <= radius; dy++ )\n"
+"        for( int dx = -radius; dx <= radius; dx++ )\n"
+"        {\n"
+"            int x = max( 0, min( cx + dx, cw - 16 ) );\n"
+"            int y = max( 0, min( cy + dy, ch - 16 ) );\n"
+"            __global const ushort *pr = ref + y * rw + x;\n"
+"            uint sad = 0;\n"
+"            for( int j = 0; j < 16; j += 2 )\n"
+"                for( int i = 0; i < 16; i += 2 )\n"
+"                {\n"
+"                    int d = (int)pc[j * cw + i] - (int)pr[j * rw + i];\n"
+"                    sad += (uint)(d < 0 ? -d : d);\n"
+"                }\n"
+"            if( sad < best.sad )\n"
+"            {\n"
+"                best.sad = sad;\n"
+"                best.mv = (short2)( x - bx, y - by );\n"
+"            }\n"
+"        }\n"
+"    out[idx] = best;\n"
 "}\n";
 
 static int gpu_cl_available( void )
@@ -394,20 +509,22 @@ static cl_device_id gpu_cl_pick_device( int device )
     return device == 0 ? best : NULL;
 }
 
-static int gpu_cl_upload( gpu_cl_ctx_t *c, cl_mem dst, const uint8_t *src,
+static int gpu_cl_upload( gpu_cl_ctx_t *c, cl_mem dst, const void *srcp,
                           int stride, int width, int height, const char *what )
 {
+    const uint8_t *src = (const uint8_t*)srcp;
     if( !src || stride < width )
         return -1;
+    size_t rb = (size_t)width * c->pxsz, sb = (size_t)stride * c->pxsz;
     if( stride == width )
-        memcpy( c->stage_ref_map, src, (size_t)width * height );
+        memcpy( c->stage_ref_map, src, rb * height );
     else
         for( int y = 0; y < height; y++ )
-            memcpy( c->stage_ref_map + (size_t)y * width, src + (size_t)y * stride, width );
+            memcpy( c->stage_ref_map + y * rb, src + (size_t)y * sb, rb );
     /* Blocking write: safe to reuse the single staging buffer immediately,
      * and reference uploads only happen on cache misses. */
     if( clEnqueueWriteBuffer( c->queue, dst, CL_TRUE, 0,
-                              (size_t)width * height, c->stage_ref_map,
+                              rb * height, c->stage_ref_map,
                               0, NULL, NULL ) != CL_SUCCESS )
     {
         (void)what;
@@ -452,9 +569,9 @@ static void gpu_cl_publish( gpu_cl_ctx_t *c, gpu_cl_frame_t *frame, int list, in
 }
 
 static int gpu_cl_analyze_common( void *ctx, gpu_cl_frame_t *frame,
-                                  const uint8_t *cur, int cur_stride,
-                                  uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
-                                  uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
+                                  const void *cur, int cur_stride,
+                                  void *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
+                                  void *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
                                   int range, int radius, int b_sync )
 {
     gpu_cl_ctx_t *c = (gpu_cl_ctx_t*)ctx;
@@ -501,7 +618,7 @@ static int gpu_cl_analyze_common( void *ctx, gpu_cl_frame_t *frame,
 
     for( int list = 0; list < 2; list++ )
     {
-        uint8_t *const *refs = list ? refs1 : refs0;
+        void *const *refs = list ? refs1 : refs0;
         const int64_t *ids = list ? ref_ids1 : ref_ids0;
         const int *strides = list ? stride1 : stride0;
         int nref = list ? nref1 : nref0;
@@ -586,9 +703,11 @@ static int gpu_cl_analyze_common( void *ctx, gpu_cl_frame_t *frame,
 
 /* --- backend entry points ------------------------------------------------- */
 
-static void *gpu_cl_create( int width, int height, int max_refs, int device )
+static void *gpu_cl_create( int width, int height, int max_refs, int device, int bit_depth )
 {
     if( width <= 0 || height <= 0 || (width & 15) || (height & 15) )
+        return NULL;
+    if( bit_depth != 8 && (bit_depth < 9 || bit_depth > 12) )
         return NULL;
     if( !gpu_cl_load() )
         return NULL;
@@ -608,6 +727,10 @@ static void *gpu_cl_create( int width, int height, int max_refs, int device )
         return NULL;
     c->w = width;
     c->h = height;
+    c->pxsz = (bit_depth == 8) ? 1 : 2;
+    c->ks_down   = (bit_depth == 8) ? "downsample4"    : "downsample4_10";
+    c->ks_coarse = (bit_depth == 8) ? "coarse_search"  : "coarse_search_10";
+    c->ks_refine = (bit_depth == 8) ? "refine_search"  : "refine_search_10";
     c->lw = (width + 3) / 4;
     c->lh = (height + 3) / 4;
     c->mbw = (width + 15) / 16;
@@ -633,19 +756,19 @@ static void *gpu_cl_create( int width, int height, int max_refs, int device )
         fprintf( stderr, "x264 OpenCL ME: kernel build failed:\n%s\n", log );
         goto fail;
     }
-    c->k_down = clCreateKernel( c->program, "downsample4", &err );
+    c->k_down = clCreateKernel( c->program, c->ks_down, &err );
     if( err != CL_SUCCESS )
         goto fail;
-    c->k_coarse = clCreateKernel( c->program, "coarse_search", &err );
+    c->k_coarse = clCreateKernel( c->program, c->ks_coarse, &err );
     if( err != CL_SUCCESS )
         goto fail;
-    c->k_refine = clCreateKernel( c->program, "refine_search", &err );
+    c->k_refine = clCreateKernel( c->program, c->ks_refine, &err );
     if( err != CL_SUCCESS )
         goto fail;
 
     {
-        size_t fsz = (size_t)width * height;
-        size_t lsz = (size_t)c->lw * c->lh;
+        size_t fsz = (size_t)width * height * c->pxsz;
+        size_t lsz = (size_t)c->lw * c->lh * c->pxsz;
         size_t csz = (size_t)c->mbw * c->mbh * GK * sizeof(x264_gpu_cand_t);
         c->d_cur = clCreateBuffer( c->cl_ctx, CL_MEM_READ_WRITE, fsz, NULL, &err );
         if( err != CL_SUCCESS ) goto fail;
@@ -760,9 +883,9 @@ static void gpu_cl_frame_free( x264_gpu_frame_t *frame )
 }
 
 static int gpu_cl_analyze( void *ctx, x264_gpu_frame_t *frame,
-                           const uint8_t *cur, int cur_stride,
-                           uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
-                           uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
+                           const void *cur, int cur_stride,
+                           void *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
+                           void *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
                            int range, int radius )
 {
     return gpu_cl_analyze_common( ctx, (gpu_cl_frame_t*)frame, cur, cur_stride,
@@ -772,9 +895,9 @@ static int gpu_cl_analyze( void *ctx, x264_gpu_frame_t *frame,
 }
 
 static int gpu_cl_analyze_async( void *ctx, x264_gpu_frame_t *frame,
-                                 const uint8_t *cur, int cur_stride,
-                                 uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
-                                 uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
+                                 const void *cur, int cur_stride,
+                                 void *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0,
+                                 void *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1,
                                  int range, int radius )
 {
     return gpu_cl_analyze_common( ctx, (gpu_cl_frame_t*)frame, cur, cur_stride,
@@ -865,4 +988,21 @@ extern const x264_gpu_backend_t x264_gpu_backend_cl =
     gpu_cl_pending_any,
     gpu_cl_frame_get,
     gpu_cl_frame_covers,
+};
+
+/* Lookahead (lowres) accelerator: not ported to OpenCL yet; the backend
+ * reports itself unavailable so the dispatcher falls back to CUDA or the CPU
+ * (both of which keep the exact-mode guarantees). */
+static int gpu_cl_la_stub_available( void ) { return 0; }
+
+extern const x264_gpu_la_backend_t x264_gpu_la_backend_cl =
+{
+    X264_GPU_BACKEND_OPENCL,
+    "opencl",
+    gpu_cl_la_stub_available,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
 };

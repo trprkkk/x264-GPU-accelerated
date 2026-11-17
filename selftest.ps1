@@ -3,7 +3,8 @@
 #   1) --gpu-me 0 output is bit-identical to the stock x264 baseline
 #   2) GPU modes run and exit cleanly
 #   3) GPU mode output is decodable (if ffmpeg is available)
-#   4) unsupported configurations fall back to the CPU with a warning
+#   4) 10-bit encoding is GPU-accelerated (CPU fallback without a usable GPU)
+#      and --gpu-lookahead (exact mode / fast-mode warning) works
 #   5) repeated GPU-mode runs are deterministic (identical SHA-1)
 #   6) GPU modes do not change frame-type decisions vs mode 0
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File selftest.ps1 [-Ffmpeg <path>]
@@ -68,11 +69,32 @@ foreach( $m in 1,2,3,4 )
 if( (Get-Content "testdata\st_gpu.log" -Raw) -match "GPU ME: " ) { Write-Host "PASS: GPU analysis active" -ForegroundColor Green }
 else { Write-Host "WARN: CUDA not active (CPU fallback)" -ForegroundColor Yellow }
 
-# 3) unsupported configuration (10-bit) falls back with a warning
+# 3) 10-bit encoding is GPU-accelerated (bit depth shown in the log); on
+#    machines without a usable GPU it degrades to the CPU fallback warning
 & $exe "--preset" "medium" "--gpu-me" "2" "--output-depth" "10" @common $yuv "-o" "NUL" 2> "testdata\st_10bit.log"
 $log = Get-Content "testdata\st_10bit.log" -Raw
-if( $log -match "GPU ME.*8-bit" ) { Write-Host "PASS: 10-bit fallback warning shown" -ForegroundColor Green }
-else { Write-Host "FAIL: 10-bit fallback warning missing" -ForegroundColor Red; $fail = 1 }
+if( $log -match "GPU ME: \S+ / .+\(10-bit\)" ) { Write-Host "PASS: 10-bit encoding is GPU-accelerated" -ForegroundColor Green }
+elseif( $log -match "GPU ME: no usable GPU backend" ) { Write-Host "WARN: no usable GPU backend, 10-bit ran on the CPU" -ForegroundColor Yellow }
+else { Write-Host "FAIL: 10-bit GPU acceleration missing" -ForegroundColor Red; $fail = 1 }
+
+# 3b) GPU lookahead (exact mode): runs cleanly, reports itself, and the
+#     reserved fast mode falls back to the CPU with a warning
+& $exe "--preset" "medium" "--gpu-me" "0" "--gpu-lookahead" "1" @common $yuv "-o" "testdata\st_la.264" 2> "testdata\st_la.log"
+$laLog = Get-Content "testdata\st_la.log" -Raw
+if( $LASTEXITCODE -eq 0 -and $laLog -match "GPU lookahead: \S+ / .+exact mode" )
+    { Write-Host "PASS: --gpu-lookahead 1 (exact mode) runs" -ForegroundColor Green }
+else { Write-Host "FAIL: --gpu-lookahead 1 failed (exit $LASTEXITCODE)" -ForegroundColor Red; $fail = 1 }
+if( $ff )
+{
+    & $ff "-v" "error" "-i" "testdata\st_la.264" "-f" "null" "NUL" 2> $null
+    if( $LASTEXITCODE -eq 0 ) { Write-Host "PASS: --gpu-lookahead 1 output decodes" -ForegroundColor Green }
+    else { Write-Host "FAIL: --gpu-lookahead 1 output failed to decode" -ForegroundColor Red; $fail = 1 }
+}
+& $exe "--preset" "medium" "--gpu-me" "0" "--gpu-lookahead" "2" @common $yuv "-o" "NUL" 2> "testdata\st_la2.log"
+$la2Log = Get-Content "testdata\st_la2.log" -Raw
+if( $la2Log -match "GPU lookahead: fast mode is not available yet" )
+    { Write-Host "PASS: --gpu-lookahead 2 warns and falls back to the CPU" -ForegroundColor Green }
+else { Write-Host "FAIL: fast-mode fallback warning missing" -ForegroundColor Red; $fail = 1 }
 
 # 4) determinism: repeated runs of the same GPU mode must be bit-identical
 $detCommon = @("--preset","slow","--crf","23","--threads","1","--frames","80","--input-res","1280x720","--fps","30")
@@ -188,7 +210,7 @@ if( $fbLog -match "GPU ME: cuda" )
 }
 else { Write-Host "SKIP: CUDA backend is not the initial backend, cannot verify fallback" -ForegroundColor Yellow }
 
-Remove-Item testdata\st_*.264,testdata\st_10bit.log,testdata\st_gpu.log,testdata\st_1080.log,testdata\st_stats.log,testdata\st_stats.log.mbtree,testdata\st.qpfile,testdata\st_ocl_a.log,testdata\st_ocl_b.log,testdata\st_fb.log -ErrorAction SilentlyContinue
+Remove-Item testdata\st_*.264,testdata\st_10bit.log,testdata\st_gpu.log,testdata\st_la.log,testdata\st_la2.log,testdata\st_1080.log,testdata\st_stats.log,testdata\st_stats.log.mbtree,testdata\st.qpfile,testdata\st_ocl_a.log,testdata\st_ocl_b.log,testdata\st_fb.log -ErrorAction SilentlyContinue
 
 if( $fail ) { Write-Host "SELFTEST FAILED" -ForegroundColor Red; exit 1 }
 Write-Host "ALL TESTS PASSED" -ForegroundColor Green

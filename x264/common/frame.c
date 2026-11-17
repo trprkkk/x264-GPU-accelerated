@@ -337,6 +337,7 @@ void x264_frame_delete( x264_frame_t *frame )
         x264_pthread_cond_destroy( &frame->cv );
 #if HAVE_CUDA
         x264_gpu_frame_free( (x264_gpu_frame_t*)frame->gpu_me );
+        x264_free( frame->gpu_la_intra );
 #endif
 #if HAVE_OPENCL
         x264_opencl_frame_delete( frame );
@@ -802,6 +803,15 @@ x264_frame_t *x264_frame_pop_unused( x264_t *h, int b_fdec )
 
     memset( frame->weight, 0, sizeof(frame->weight) );
     memset( frame->f_weighted_cost_delta, 0, sizeof(frame->f_weighted_cost_delta) );
+
+#if HAVE_CUDA
+    /* Frame structs are recycled without being re-zeroed, so the GPU
+     * lookahead caches must be cleared or a reused struct would carry
+     * dangling pointers from its previous incarnation. */
+    frame->gpu_la_intra = NULL;
+    frame->gpu_la_R = 0;
+    memset( frame->gpu_la_tab, 0, sizeof( frame->gpu_la_tab ) );
+#endif
 
     return frame;
 }

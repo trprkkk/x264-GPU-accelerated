@@ -442,6 +442,7 @@ REALIGN_STACK void x264_param_default( x264_param_t *param )
     param->analyse.f_psy_trellis = 0;
     param->analyse.i_me_range = 16;
     param->analyse.i_gpu_me = 0;
+    param->analyse.i_gpu_la = 0;
     param->analyse.i_gpu_me_range = 64;
     param->analyse.i_gpu_me_radius = 2;
     param->analyse.i_gpu_me_refs = 2;
@@ -1273,6 +1274,8 @@ REALIGN_STACK int x264_param_parse( x264_param_t *p, const char *name, const cha
         p->analyse.i_me_range = atoi(value);
     OPT("gpu-me")
         p->analyse.i_gpu_me = atoi(value);
+    OPT("gpu-lookahead")
+        p->analyse.i_gpu_la = atoi(value);
     OPT("gpu-me-range")
         p->analyse.i_gpu_me_range = atoi(value);
     OPT("gpu-me-radius")
@@ -1479,6 +1482,8 @@ char *x264_param2string( x264_param_t *p, int b_res )
         s += sprintf( s, " gpu_me=%d:%d:%d:%d:%d", p->analyse.i_gpu_me,
                       p->analyse.i_gpu_me_range, p->analyse.i_gpu_me_radius,
                       p->analyse.i_gpu_me_refs, p->analyse.i_gpu_me_device );
+    if( p->analyse.i_gpu_la )
+        s += sprintf( s, " gpu_la=%d:%d", p->analyse.i_gpu_la, p->analyse.i_gpu_me_device );
     s += sprintf( s, " chroma_me=%d", p->analyse.b_chroma_me );
     s += sprintf( s, " trellis=%d", p->analyse.i_trellis );
     s += sprintf( s, " 8x8dct=%d", p->analyse.b_transform_8x8 );

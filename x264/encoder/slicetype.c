@@ -29,6 +29,10 @@
 #include "macroblock.h"
 #include "me.h"
 
+#if HAVE_CUDA
+#include "common/gpu.h"
+#endif
+
 // Indexed by pic_struct values
 static const uint8_t delta_tfi_divisor[10] = { 0, 2, 1, 1, 2, 2, 3, 3, 4, 6 };
 
@@ -511,6 +515,80 @@ void x264_weights_analyse( x264_t *h, x264_frame_t *fenc, x264_frame_t *ref, int
 #define NUM_ROWS 3
 #define ROW_SATD (NUM_INTS + (h->mb.i_mb_y - h->i_threadslice_start))
 
+#if HAVE_CUDA
+/* GPU lookahead (exact mode) helpers.
+ *
+ * The GPU precomputes exactly the values the CPU lookahead would compute
+ * pixel-by-pixel:
+ *   - the raw intra costs of the lowres 8x8 blocks (slicetype_mb_cost's
+ *     lowres_intra_mb section, before the depth shift and penalty), and
+ *   - exhaustive 8x8 SAD squares over the ME's fullpel positions for each
+ *     (fenc, ref) pair, which me_search consults instead of calling
+ *     pixf.fpelcmp.
+ * Because the values are bit-identical to the CPU's, every decision stays
+ * identical; a missing or failed table simply makes the CPU compute the
+ * values itself, which is exact by construction.  The tables cover all
+ * positions the search can evaluate: the mv_limit box (which bounds every
+ * CHECK_MVRANGE-guarded candidate) widened by the +-2 hexagon ring shell. */
+
+#define GPU_LA_TAB_RMAX 32
+
+static void gpu_la_prep_intra( x264_t *h, x264_frame_t *fenc )
+{
+    if( fenc->gpu_la_intra || fenc->b_intra_calculated || h->mb.i_mb_width <= 0 )
+        return;
+    int mbcount = h->mb.i_mb_width * h->mb.i_mb_height;
+    int32_t *raw = x264_malloc( mbcount * sizeof(int32_t) );
+    if( !raw )
+        return;
+    /* Same conditions as mbcmp_init() used when wiring pixf.intra_mbcmp_x3 */
+    int satd = !h->mb.b_lossless && h->param.analyse.i_subpel_refine > 1;
+    int rows = h->mb.i_mb_height * 8 + 2 * PADV;
+    int base_off = PADH_ALIGN + PADV * fenc->i_stride_lowres;
+    if( x264_gpu_la_intra( h->gpu_la_ctx, fenc->buffer_lowres, base_off,
+                           fenc->i_stride_lowres, rows, satd, raw ) < 0 )
+    {
+        x264_log( h, X264_LOG_WARNING, "GPU lookahead: intra pre-pass failed, using the CPU\n" );
+        x264_free( raw );
+        return;
+    }
+    fenc->gpu_la_intra = raw;
+}
+
+static void gpu_la_prep_table( x264_t *h, x264_frame_t *fenc, x264_frame_t *ref,
+                               int list, int dist, const x264_weight_t *w )
+{
+    /* mv_limit_fpel spans [-(i_mv_range), i_mv_range-1] in half-res full-pel
+     * units (mv_range = 2 * i_mv_range quarter-pel), widened by the ring
+     * shell; edge macroblocks are strictly inside. */
+    int R = X264_MIN( h->param.analyse.i_mv_range / 2 + 2, GPU_LA_TAB_RMAX );
+    const void *rbase = ref->buffer_lowres;
+    int roff = PADH_ALIGN + PADV * ref->i_stride_lowres;
+    int rstride = ref->i_stride_lowres;
+    if( list == 0 && w && w[0].weightfn )
+    {
+        /* me_search compares against the scaled lowres plane in this case */
+        rbase = h->mb.p_weight_buf[0];
+    }
+    /* The search's fpel metric: mbcmp_init() puts satd into pixf.fpelcmp
+     * (instead of sad) when subme > 1 and me_method is TESA, so the table
+     * must reproduce exactly that function for the values to match. */
+    int b_satd = !h->mb.b_lossless && h->param.analyse.i_subpel_refine > 1 &&
+                 h->param.analyse.i_me_method == X264_ME_TESA;
+    int rows = h->mb.i_mb_height * 8 + 2 * PADV;
+    uint16_t *tab = x264_gpu_la_table( h->gpu_la_ctx, fenc->buffer_lowres,
+                                       PADH_ALIGN + PADV * fenc->i_stride_lowres,
+                                       fenc->i_stride_lowres, rbase, roff, rstride,
+                                       rows, R, b_satd );
+    if( tab )
+    {
+        fenc->gpu_la_tab[list][dist] = tab;
+        fenc->gpu_la_R = R;
+    }
+    /* On failure the slot stays NULL: the CPU search runs as usual. */
+}
+#endif
+
 static void slicetype_mb_cost( x264_t *h, x264_mb_analysis_t *a,
                                x264_frame_t **frames, int p0, int p1, int b,
                                int dist_scale_factor, int do_search[2], const x264_weight_t *w,
@@ -538,6 +616,26 @@ static void slicetype_mb_cost( x264_t *h, x264_mb_analysis_t *a,
     x264_me_t m[2];
     int i_bcost = COST_MAX;
     int list_used = 0;
+#if HAVE_CUDA
+    /* GPU lookahead (exact mode): hand the precomputed SAD squares to the
+     * searches.  The fields are set on every call (including to NULL) so no
+     * stale table can leak into another (fenc, ref) pair, and the encoder's
+     * own searches (i_list >= 0) ignore them entirely. */
+    m[0].la_tab = m[1].la_tab = NULL;
+    m[0].la_R = m[1].la_R = 0;
+    if( b != p0 && fenc->gpu_la_tab[0][b-p0-1] )
+    {
+        m[0].la_tab = fenc->gpu_la_tab[0][b-p0-1];
+        m[0].la_R = fenc->gpu_la_R;
+        m[0].la_mboff = i_mb_xy * (2*m[0].la_R+1) * (2*m[0].la_R+1);
+    }
+    if( b_bidir && fenc->gpu_la_tab[1][p1-b-1] )
+    {
+        m[1].la_tab = fenc->gpu_la_tab[1][p1-b-1];
+        m[1].la_R = fenc->gpu_la_R;
+        m[1].la_mboff = i_mb_xy * (2*m[1].la_R+1) * (2*m[1].la_R+1);
+    }
+#endif
     /* A small, arbitrary bias to avoid VBV problems caused by zero-residual lookahead blocks. */
     int lowres_penalty = 4;
 
@@ -723,6 +821,25 @@ skip_motionest:
 lowres_intra_mb:
     if( !fenc->b_intra_calculated )
     {
+        if( fenc->gpu_la_intra )
+        {
+            /* GPU lookahead (exact mode): the raw minimum predictor cost was
+             * precomputed; apply the same depth shift, penalty and AQ
+             * scaling the CPU block below would, without recomputing it. */
+            int i_icost = ((fenc->gpu_la_intra[i_mb_xy] + 5 * a->i_lambda)
+                           >> (BIT_DEPTH - 8)) + lowres_penalty;
+            fenc->i_intra_cost[i_mb_xy] = i_icost;
+            int i_icost_aq = i_icost;
+            if( h->param.rc.i_aq_mode )
+                i_icost_aq = (i_icost_aq * fenc->i_inv_qscale_factor[i_mb_xy] + 128) >> 8;
+            output_intra[ROW_SATD] += i_icost_aq;
+            if( b_frame_score_mb )
+            {
+                output_intra[COST_EST] += i_icost;
+                output_intra[COST_EST_AQ] += i_icost_aq;
+            }
+            goto lowres_intra_done;
+        }
         ALIGNED_ARRAY_16( pixel, edge,[36] );
         pixel *pix = &pix1[8+FDEC_STRIDE];
         pixel *src = &fenc->lowres[0][i_pel_offset];
@@ -764,6 +881,7 @@ lowres_intra_mb:
             output_intra[COST_EST_AQ] += i_icost_aq;
         }
     }
+lowres_intra_done:
     i_bcost = (i_bcost >> (BIT_DEPTH - 8)) + lowres_penalty;
 
     /* forbid intra-mbs in B-frames, because it's rare and not worth checking */
@@ -877,6 +995,21 @@ static int slicetype_frame_cost( x264_t *h, x264_mb_analysis_t *a,
 
         if( p1 != p0 )
             dist_scale_factor = ( ((b-p0) << 8) + ((p1-p0) >> 1) ) / (p1-p0);
+
+#if HAVE_CUDA
+        /* GPU lookahead (exact mode): precompute what the CPU would compute
+         * pixel-by-pixel for this (fenc, ref) pass.  The weights must be
+         * analysed first (the table has to match the plane me_search will
+         * read).  Any failure leaves the corresponding part on the CPU. */
+        if( h->gpu_la_ctx && h->param.analyse.i_gpu_la == 1 )
+        {
+            gpu_la_prep_intra( h, fenc );
+            if( do_search[0] )
+                gpu_la_prep_table( h, fenc, frames[p0], 0, b-p0-1, w );
+            if( do_search[1] )
+                gpu_la_prep_table( h, fenc, frames[p1], 1, p1-b-1, x264_weight_none );
+        }
+#endif
 
         int output_buf_size = h->mb.i_mb_height + (NUM_INTS + PAD_SIZE) * h->param.i_lookahead_threads;
         int *output_inter[X264_LOOKAHEAD_THREAD_MAX+1];

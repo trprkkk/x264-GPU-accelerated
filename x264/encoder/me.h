@@ -52,6 +52,15 @@ typedef struct
 
     ALIGNED_4( int16_t mvp[2] );
 
+    /* GPU lookahead (exact mode), read by me_search only when i_list < 0
+     * (the slicetype lowres search); the encoder's own searches (i_list
+     * >= 0) never touch these fields.  When la_tab is set, integer-pel SADs
+     * come from the precomputed (2*la_R+1)^2 square around the block origin;
+     * positions outside it fall back to the CPU SAD. */
+    const uint16_t *la_tab;
+    int16_t la_R;
+    int     la_mboff;   /* element offset of this MB's square inside la_tab */
+
     /* output */
     int cost_mv;        /* lambda * nbits for the chosen mv */
     int cost;           /* satd + lambda * nbits */

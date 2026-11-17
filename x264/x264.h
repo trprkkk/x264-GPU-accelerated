@@ -417,6 +417,7 @@ typedef struct x264_param_t
         int          i_me_method; /* motion estimation algorithm to use (X264_ME_*) */
         int          i_me_range; /* integer pixel motion estimation search range (from predicted mv) */
         int          i_gpu_me;       /* CUDA pre-analysis: 0=off, 1=seed, 2=seed+local CPU search, 3=replace fullpel */
+        int          i_gpu_la;       /* GPU lookahead: 0=off, 1=exact (identical to CPU lookahead), 2=fast (GPU decisions) */
         int          i_gpu_me_range; /* full-resolution range of the GPU coarse search */
         int          i_gpu_me_radius;/* full-resolution refinement radius around each coarse candidate */
         int          i_gpu_me_refs;  /* maximum reference frames analysed on the GPU (0 = all) */

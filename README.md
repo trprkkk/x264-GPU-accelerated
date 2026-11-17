@@ -10,6 +10,9 @@ H.264 エンコーダです。
   本物のコスト関数 (SATD + λ·MV コスト、RDO) で評価し直します。
 - `--gpu-me 0` (既定) は GPU を一切使わず、**stock x264 とビット単位で同一**の出力を
   生成します (検証済み)。
+- v1.0.2 からは **GPU lookahead (`--gpu-lookahead`)** も追加されました。GPU が
+  ルックアヘッド (低解像度解析) のコスト計算を先読みし、exact モードでは
+  **CPU と同一の判断を保証**します (詳細は下記「GPU lookahead」)。
 
 ---
 
@@ -17,13 +20,13 @@ H.264 エンコーダです。
 
 | 項目 | 内容 |
 |---|---|
-| 対象 | H.264/AVC (x264 フォーク、High profile / 8-bit ビルドで GPU 有効) |
+| 対象 | H.264/AVC (x264 フォーク、High profile / 8-bit・10-bit ビルドで GPU 有効) |
 | GPU 利用 | 汎用 CUDA / OpenCL カーネル (NVENC/QSV 等の固定機能は不使用) |
 | 画質 | GPU は候補を「追加」するだけ。CPU が本物のコストで選び直すため、実測でも SSIM 差は ±0.00005 以内 |
 | 互換性 | 出力は通常の H.264 ストリーム。MPC-HC / ffmpeg 等でデコード可能 (検証済み) |
 | 対応解像度 | 任意 (x264 準拠。MB 境界までパディングして GPU 解析。1080p も GPU 加速) |
 | 速度 | `--me esa` / `--me tesa` で **+17〜+47%** (2 測定セッション。下記ベンチマーク) |
-| 既定動作 | `--gpu-me 0`。従来と完全に同一・ビット一致 |
+| 既定動作 | `--gpu-me 0` / `--gpu-lookahead 0`。従来と完全に同一・ビット一致 |
 | フォールバック | CUDA 不可の GPU は OpenCL へ自動切替。GPU 自体が無い / 非対応条件では警告を出して自動的に CPU 動作へ |
 
 ### モード一覧
@@ -35,6 +38,33 @@ H.264 エンコーダです。
 | `2` | 全パーティションに GPU 候補を追加し、CPU 探索範囲を ±4 に縮小 | **推奨**。esa/tesa で +28〜29% 高速化 (品質ゲート通過) |
 | `3` | 全パーティションに GPU 候補を追加し、CPU のフルペル探索を省略 | 最速。品質は内容依存 (BD-rate +0.4〜+1.9%、下記品質ゲート参照) |
 | `4` | GPU 候補を追加し、CPU 探索範囲を ±1 に縮小 | 速度と品質のバランス (mode 2 と 3 の中間) |
+
+### GPU lookahead (`--gpu-lookahead`)
+
+x264 はフレームタイプ (I/P/B) や MB ツリーの決定に**低解像度 (1/2) 解析
+(ルックアヘッド)** を使います。`--gpu-lookahead` はこの解析の重い部分
+(8x8 ブロックごとの intra コストと、(fenc, ref) ペアごとの網羅的な 8x8
+コスト正方テーブル) を GPU が先読みする機能です。
+
+| `--gpu-lookahead` | 動作 | 用途 |
+|---|---|---|
+| `0` | GPU オフ (既定) | 従来と同じ。ビット一致 |
+| `1` | **exact モード**: GPU が CPU が計算するはずの値をビット単位で同じに先計算し、CPU 探索はテーブルを参照 | 出力を一切変えずにルックアヘッドの SAD/SATD 計算を GPU へオフロード |
+| `2` | fast モード (GPU が判断も行う) | **未実装**。指定すると警告を出して CPU にフォールバックします |
+
+exact モードの契約:
+
+- GPU が先計算するのは (a) 8x8 lowres ブロックの raw 最小 intra 予測コスト、
+  (b) MB 中心 ±R (R = min(mvrange/2 + 2, 32)) の全変位に対する 8x8 SAD/SATD
+  (メトリックは CPU の `fpelcmp` に一致。`--me tesa` + subme>1 では SATD) です。
+- テーブルに無い位置 (範囲外・テーブル作成失敗時) は **CPU が自前で同じ
+  関数を計算する**ため、探索結果は CPU のみの場合と常に一致します。
+  GPU 失敗時も出力は変わりません (CPU フォールバック)。
+- `--gpu-lookahead 1` を付けると SEI のパラメータ文字列に `gpu_la=1:0` が
+  入るため、未指定時の stock x264 とは**ハッシュが変わります** (ヘッダのみ。
+  ビデオ内容の符号化判断は同一)。未指定時の出力は従来とビット一致です。
+- 本家 x264 の `--opencl` (OpenCL lookahead) は**別機能**で、本フォークでも
+  元のまま維持しています。両者は独立で、同時指定は推奨しません。
 
 ---
 
@@ -54,7 +84,7 @@ H.264 エンコーダです。
 
 GPU 対応条件 (これ以外は自動で CPU フォールバック):
 
-- 8-bit エンコード (`--output-depth 8`)
+- 8-bit / 10-bit エンコード (`--output-depth 8` / `10`)。12-bit は CPU フォールバック
 - プログレッシブ (インターレースは非対応)
 
 GPU 世代ごとのバックエンド (既定の自動選択。実行時に解析が失敗した場合は
@@ -162,6 +192,7 @@ x264 --preset slow --crf 23 --gpu-me 2 input.yuv --input-res 1280x720 -o out.264
 | `--gpu-me-radius <int>` | `2` | 粗探索候補周辺の全解像度リファイン半径 (0〜8) |
 | `--gpu-me-refs <int>` | `2` | GPU 解析する参照フレーム数 (0 = すべて、最大 4) |
 | `--gpu-me-device <int>` | `0` | GPU デバイス番号 |
+| `--gpu-lookahead <0-2>` | `0` | GPU ルックアヘッド (低解像度解析) モード: 0=オフ、1=exact (CPU 同一判断保証)、2=fast (未実装。CPU フォールバック) |
 
 ### 推奨構成
 
@@ -188,8 +219,16 @@ x264 [info]: GPU ME: opencl / NVIDIA GeForce RTX 2060 SUPER (OpenCL 3.0 CUDA)
 
 ```
 x264 [warning]: GPU ME: interlaced coding is not supported, falling back to CPU
-x264 [warning]: GPU ME: only supported in the 8-bit build, falling back to CPU
 x264 [warning]: GPU ME: no usable GPU backend, falling back to CPU
+```
+
+GPU lookahead も同様です。
+
+```
+x264 [info]: GPU lookahead: cuda / NVIDIA GeForce RTX 2060 SUPER (sm_75) (exact mode, 8-bit)
+x264 [warning]: GPU lookahead: fast mode is not available yet, falling back to CPU
+x264 [warning]: GPU lookahead: interlaced coding is not supported, falling back to CPU
+x264 [warning]: GPU lookahead: no usable GPU backend, falling back to CPU
 ```
 
 ---
@@ -336,10 +375,16 @@ x264 [warning]: GPU ME: no usable GPU backend, falling back to CPU
 | v1.0.0 (13.3 カーネル) との A/B | ✅ 6 ケースすべてビット一致 (720p m1/m4/medium-m2、1080p medium-m2/placebo-m2/m3) — 11.8 カーネル + ドライバ API 化は出力を変えない |
 | 旧世代カーネル経路の検証 | ✅ `X264_GPU_FATBIN=legacy` で 11.8 カーネルを明示ロードして全ハッシュ一致。13.x カーネルのみを強制した場合は `NO_BINARY_FOR_GPU` を検出し OpenCL へ自動フォールバック |
 | 実行時バックエンドフォールバック | ✅ 起動時プローブで非対応 GPU を検出、解析失敗時はもう一方へ 1 回切替 (出力はビット一致のまま)。selftest で自動検証 |
-| 10-bit 出力 | ✅ 警告を出して CPU フォールバック |
+| 10-bit 出力 | ✅ GPU 有効 (`GPU ME: ... (10-bit)`)。10-bit でも GPU ME / GPU lookahead ともに動作し、`--gpu-lookahead 1` は 10-bit でも CPU とビット一致 (下記参照) |
 | インターレース | ✅ 警告を出して CPU フォールバック |
 | GPU モードの再現性 (同一入力・同一設定) | ✅ mode 1/2/3 の反復実行が SHA-1 一致 (240 frames placebo) |
 | フレームタイプ決定が GPU モードに依存しない | ✅ `--gpu-me 0/1/2/3` で I/P/B 列が完全一致、stock とも一致 (240 frames placebo) |
+| **GPU lookahead (exact モード) のビット一致** | ✅ `--gpu-lookahead 1` (60f 720p CRF23 threads1 `--gpu-me 0`): medium `6A50DA31…` / ultrafast `624677FE…` / superfast `EBE94973…` / veryslow `86D27CA7…` / placebo `52A6DBFD…` が、テーブルを一切使わない all-CPU 実行 (`X264_GPU_LA_SKIP` 相当) と SHA-1 完全一致。placebo (TESA→`fpelcmp`=SATD) はテーブル側も SATD を計算して一致 |
+| GPU lookahead のテーブル照合 | ✅ f1 の全 15,210,000 エントリ (720p, R=32) が CPU の `fpelcmp[8x8]` と 0 ミスマッチ。intra カーネルも 0/3600 ミスマッチ (複数フレーム) |
+| GPU lookahead × `--lookahead-threads 2` | ✅ medium / placebo とも 1 スレッド結果と同一ハッシュ |
+| GPU lookahead × 10-bit | ✅ medium `D0E5BD4F…` / placebo `C267975F…` が all-CPU 実行とビット一致 (10-bit SATD カーネル含む) |
+| GPU lookahead × GPU ME 同時使用 | ✅ `--gpu-me 2 --gpu-lookahead 1` で LA 部分のみ GPU/CPU を切り替えても同一ハッシュ (`D383AF1E…`) |
+| `--gpu-lookahead` 未指定時の不変条件 | ✅ g0 = `BEB55C36…`、m2 = `965066A7…`、m3 = `B3090B30…`、OpenCL m2 は全て従来値を維持 (オプション追加による出力変化なし) |
 | NVENC (固定機能) との画質比較 | ✅ 5 レート帯すべてで少ないビットで高 SSIM/PSNR (BD-rate −33.6% / −40.7%) |
 | 品質ゲート (BD-rate × 3クリップ) | ✅ PASS (26比較。最悪 SSIM +1.92% は mode 3/4 の 1080p、mode 2 は +0.37% 以内) |
 | ヘッダ変更時の差分ビルド | ✅ `.d` が全インクルードヘッダを記録 (msvsdepend.sh 修正) |
@@ -398,6 +443,46 @@ x264_encoder_encode()
   `i_frame`) で照合し、**最終リストを覆っている場合のみ採用**します。覆って
   いなければ従来どおりの同期解析にフォールバックするため、ビットストリームは
   非同期の有無で変わりません (全回帰ハッシュで一致を確認)。
+- **GPU lookahead は値を先計算するだけ。** exact モード (`--gpu-lookahead 1`)
+  では GPU は「CPU が計算するはずの intra コストと 8x8 コストテーブル」を
+  ビット単位で同じ値で事前計算し、CPU の探索 (`me_search`) はその値を参照する
+  だけです。テーブルに無い位置は CPU が同じ関数で自前計算するため、判断は
+  GPU の有無で一切変わりません (GPU 失敗時も CPU に落ちて同一出力)。
+
+### GPU lookahead (低解像度解析の先読み)
+
+`--gpu-lookahead 1` (exact モード) の処理フロー:
+
+```
+x264_slicetype_frame_cost()                [encoder/slicetype.c]
+  ├─ x264_weights_analyse()                重み決定 (テーブルの参照面が決まる)
+  ├─ gpu_la_prep_intra()                   各 8x8 lowres ブロックの raw 最小
+  │                                        intra 予測コストを GPU で一括計算
+  │                                        (la_intra カーネル。SATD/SAD は
+  │                                         mbcmp_init と同じ条件で選択)
+  ├─ gpu_la_prep_table()                   (fenc, ref, dist) ごとに、全 MB ×
+  │                                        変位 (dx,dy) ∈ [-R,R]² の 8x8
+  │                                        SAD/SATD 正方テーブルを GPU で一括
+  │                                        計算 (la_table カーネル。R = min(
+  │                                         mvrange/2+2, 32)、重み付き参照時は
+  │                                         加算後の lowres 平面を参照)
+  └─ slicetype_mb_cost() → me_search()
+      ├─ GPU_LA_SAD がテーブル値を返す (範囲外は CPU が fpelcmp で計算)
+      ├─ intra コストも GPU 結果を採用 (depth shift / penalty / AQ は CPU 側で
+      │   元の CPU 経路と同じ式を適用)
+      └─ 探索ロジック (hex/subpel/bidir) は全て元の x264 のまま
+```
+
+- テーブルは `(fenc, list, dist)` ごとにキャッシュされ、検索済みペアの再解析
+  (b-adapt の DP が同一パスを再訪) では再計算されません。
+- テーブルの値は `fpelcmp[PIXEL_8x8]` と同じ関数の値です。`--me tesa` +
+  subme>1 (placebo など) の場合は `fpelcmp` が SATD になるため、テーブル側も
+  同じ Hadamard SATD を計算します (SAD のままにすると placebo で不一致に
+  なるため、v1.0.2 で修正済み)。
+- フレーム再利用に備え、`x264_frame_pop_unused()` が `gpu_la_*` フィールドを
+  リセットします (x264 はフレーム構造体をゼロ化せずに使い回すため)。
+- OpenCL バックエンドの lookahead 実装は未移植です (CUDA 専用。OpenCL のみ
+  の環境では GPU lookahead は CPU にフォールバックします)。
 
 ### バックエンド (CUDA / OpenCL)
 
@@ -471,6 +556,12 @@ x264_encoder_encode()
 | `encoder/me.h` / `encoder/analyse.c` | `x264_me_t` に `i_list` / `i_xoff` / `i_yoff` を追加し、候補検索用の情報を設定 |
 | `encoder/me.c` | GPU 候補の注入 (mode 1/2/3/4)。`i_list >= 0` を必須条件とする |
 | `encoder/slicetype.c` | ルックアヘッドの低解像度 ME に `i_list = -1` を設定し、GPU 候補の注入対象外にする |
+| `common/gpu.h` / `gpu.c` | ルックアヘッド用 API (`x264_gpu_la_*`) とバックエンド・ディスパッチャ (`x264_gpu_la_backend_t`) |
+| `common/gpu_kernels.cu` | `la_intra(_10)` / `la_table(_10)` カーネル (intra 予測器・SATD/SAD を CPU 実装から正確に転写) |
+| `common/gpu_cuda.cpp` | ルックアヘッド用 CUDA ホスト (ピン留めホストリング、平面転送、遅延 grow) |
+| `common/gpu_cl.c` | ルックアヘッドの OpenCL スタブ (未移植。available=0 で CPU フォールバック) |
+| `common/frame.h` / `frame.c` | フレームごとの `gpu_la_intra` / `gpu_la_tab` / `gpu_la_R` と `pop_unused` でのリセット |
+| `x264.h` / `common/base.c` / `x264.c` | `--gpu-lookahead` オプションと SEI パラメータ文字列 (`gpu_la=<mode>:<device>`) |
 | `Makefile` | `common/gpu*.o`・カーネル fatbin・リソース (`gpu_res.o`) のビルド規則と `cudart_static.lib` のリンク |
 | `x264/tools/msvsdepend.sh` | Windows 差分ビルドのヘッダ依存生成を修正 (日本語ロケールの `/showIncludes` 対応、ビット深度定義の付与、失敗時のビルド中断) |
 | `configure-msvc.sh` / `make-msvc.sh` | GPU 設定 (2 系統の CUDA / OpenCL) の追記、ライブラリ・ヘッダパス設定 |
@@ -481,14 +572,29 @@ x264_encoder_encode()
 
 ## 8. 既知の制限と今後の課題
 
-- **8-bit のみ**。10-bit / 12-bit エンコードでは GPU は使われません (CPU フォールバック)。
-- **インターレース非対応** (CPU フォールバック)。
+- **12-bit エンコードでは GPU は使われません** (8-bit / 10-bit は対応。CPU フォールバック)。
+- **インターレース非対応** (GPU ME / GPU lookahead とも CPU フォールバック)。
 - **CUDA 利用にはドライバ R451 以降が必要**。それ以前のドライバでは CUDA
   カーネルがロードできず、OpenCL (または CPU) へ自動フォールバックします。
 - **Kepler〜Volta の CUDA 経路は実機検証が未実施**。カーネルは全世代で同一
   ソース・同一アルゴリズムで、sm_75 上で 11.8 カーネルの出力一致を検証済み
   ですが、Kepler〜Volta の実機での動作確認はできていません (OpenCL 経路は
-  NVIDIA のドライバ同梱実装を使用)。
+  NVIDIA のドライバ同梱実装を使用)。GPU lookahead も同様に sm_75 実機のみの
+  検証です (失敗時は CPU にフォールバックして出力は変わりません)。
+- **exact モード (`--gpu-lookahead 1`) は現状、ルックアヘッドが軽い設定では
+  逆に遅くなります。** CPU 探索が評価する数十位置に対し、GPU は MB あたり
+  (2R+1)² = 最大 4,225 位置のテーブルを事前計算するためです (60f 720p の
+  実測: medium 1.5s→6.4s、placebo 24.6s→58.7s)。テーブルは (fenc, ref, dist)
+  ごとに 1 回しか計算されず、ルックアヘッドが重い (パスを何度も回す) ワーク
+  ロードほど相対コストは下がりますが、速度目的であれば現時点では
+  `--gpu-me` のみの利用を推奨します。exact モードは「出力を一切変えずに
+  ルックアヘッドの計算を GPU に置換できる」ことの保証が主目的で、
+  速度を狙う fast モード (`--gpu-lookahead 2`、GPU が判断も行う) は今後の課題です。
+- **GPU lookahead の OpenCL 実装は未移植** (CUDA 専用)。OpenCL のみの環境では
+  警告を出して CPU にフォールバックします。
+- **本家 `--opencl` (OpenCL lookahead) は変更していません。** 本フォークの
+  `--gpu-lookahead` は独立した機能で、`--opencl` とは併用しないでください
+  (両方が低解像度解析に介入します)。
 - **x265/HEVC 版は未収録**。本フォークは x264 (H.264) のみです。
 - **OpenCL バックエンドは NVIDIA 実機のみ検証済み**。カーネルはポータブルな
   OpenCL C 1.2 の範囲のみ使用していますが、AMD/Intel 実機での検証は未実施です。

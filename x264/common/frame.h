@@ -70,6 +70,15 @@ typedef struct x264_frame
 
     void   *gpu_me;      /* x264_gpu_frame_t: CUDA integer-pel candidates for this frame */
 
+    /* GPU lookahead (exact mode), lowres analysis:
+     * gpu_la_intra holds the raw per-MB intra cost (the minimum predictor
+     * SATD/SAD before the depth shift and penalty), gpu_la_tab[l][dist] the
+     * per-MB SAD square for one (fenc, ref) pair.  Both contain exactly the
+     * values the CPU path would compute; NULL means "use the CPU". */
+    int32_t  *gpu_la_intra;
+    uint16_t *gpu_la_tab[2][X264_BFRAME_MAX+1];
+    int16_t   gpu_la_R;
+
     /* YUV buffer */
     int     i_csp; /* Internal csp */
     int     i_plane;

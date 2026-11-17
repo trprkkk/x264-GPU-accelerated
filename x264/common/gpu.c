@@ -22,7 +22,7 @@ typedef struct
     const x264_gpu_backend_t *old_be;   /* retired backend, kept for frame frees */
     void *old_impl;
     /* creation parameters, needed to build a fallback backend */
-    int w, h, max_refs, device;
+    int w, h, max_refs, device, bit_depth;
 } gpu_ctx_pub_t;
 
 static const x264_gpu_backend_t *gpu_backend_by_id( int id )
@@ -42,7 +42,7 @@ static const x264_gpu_backend_t *gpu_backend_of_frame( const x264_gpu_frame_t *f
     return gpu_backend_by_id( ((const x264_gpu_frame_header_t*)frame)->backend );
 }
 
-void *x264_gpu_create( int width, int height, int max_refs, int device, int backend )
+void *x264_gpu_create( int width, int height, int max_refs, int device, int backend, int bit_depth )
 {
     const x264_gpu_backend_t *be = NULL;
     void *impl = NULL;
@@ -53,14 +53,14 @@ void *x264_gpu_create( int width, int height, int max_refs, int device, int back
         {
             be = gpu_backend_by_id( order[i] );
             if( be && be->available() )
-                impl = be->create( width, height, max_refs, device );
+                impl = be->create( width, height, max_refs, device, bit_depth );
         }
     }
     else
     {
         be = gpu_backend_by_id( backend );
         if( be && be->available() )
-            impl = be->create( width, height, max_refs, device );
+            impl = be->create( width, height, max_refs, device, bit_depth );
     }
     if( !impl )
         return NULL;
@@ -76,6 +76,7 @@ void *x264_gpu_create( int width, int height, int max_refs, int device, int back
     pub->h = height;
     pub->max_refs = max_refs;
     pub->device = device;
+    pub->bit_depth = bit_depth;
     return pub;
 }
 
@@ -106,7 +107,7 @@ int x264_gpu_fallback( void *ctx )
         if( !be || be == pub->be || !be->available() )
             continue;
         pub->be->finish( pub->impl );   /* drain anything in flight */
-        void *impl = be->create( pub->w, pub->h, pub->max_refs, pub->device );
+        void *impl = be->create( pub->w, pub->h, pub->max_refs, pub->device, pub->bit_depth );
         if( !impl )
             continue;
         pub->old_be = pub->be;
@@ -151,9 +152,9 @@ static int gpu_frame_is_current( const gpu_ctx_pub_t *pub, const x264_gpu_frame_
 }
 
 #define GPU_ANALYZE_ARGS \
-    x264_gpu_frame_t *frame, const uint8_t *cur, int cur_stride, \
-    uint8_t *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0, \
-    uint8_t *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1, \
+    x264_gpu_frame_t *frame, const void *cur, int cur_stride, \
+    void *const refs0[], const int64_t ref_ids0[], const int stride0[], int nref0, \
+    void *const refs1[], const int64_t ref_ids1[], const int stride1[], int nref1, \
     int range, int radius
 
 int x264_gpu_analyze( void *ctx, GPU_ANALYZE_ARGS )
@@ -207,4 +208,93 @@ int x264_gpu_frame_covers( const x264_gpu_frame_t *frame,
 {
     const x264_gpu_backend_t *be = gpu_backend_of_frame( frame );
     return be ? be->frame_covers( frame, list, ref_plane, ref_id ) : 0;
+}
+
+/* ---------------- lookahead (lowres) acceleration ------------------------- */
+
+typedef struct
+{
+    const x264_gpu_la_backend_t *be;
+    void *impl;
+} gpu_la_pub_t;
+
+static const x264_gpu_la_backend_t *gpu_la_backend_by_id( int id )
+{
+    if( id == X264_GPU_BACKEND_CUDA )   return &x264_gpu_la_backend_cuda;
+    if( id == X264_GPU_BACKEND_OPENCL ) return &x264_gpu_la_backend_cl;
+    return NULL;
+}
+
+void *x264_gpu_la_create( int mbw, int mbh, int device, int backend, int bit_depth )
+{
+    const x264_gpu_la_backend_t *be = NULL;
+    void *impl = NULL;
+    if( backend == X264_GPU_BACKEND_AUTO )
+    {
+        static const int order[2] = { X264_GPU_BACKEND_CUDA, X264_GPU_BACKEND_OPENCL };
+        for( int i = 0; i < 2 && !impl; i++ )
+        {
+            be = gpu_la_backend_by_id( order[i] );
+            if( be && be->available() )
+                impl = be->create( mbw, mbh, device, bit_depth );
+        }
+    }
+    else
+    {
+        be = gpu_la_backend_by_id( backend );
+        if( be && be->available() )
+            impl = be->create( mbw, mbh, device, bit_depth );
+    }
+    if( !impl )
+        return NULL;
+    gpu_la_pub_t *pub = (gpu_la_pub_t*)calloc( 1, sizeof(*pub) );
+    if( !pub )
+    {
+        be->destroy( impl );
+        return NULL;
+    }
+    pub->be = be;
+    pub->impl = impl;
+    return pub;
+}
+
+void x264_gpu_la_destroy( void *ctx )
+{
+    gpu_la_pub_t *pub = (gpu_la_pub_t*)ctx;
+    if( !pub )
+        return;
+    pub->be->destroy( pub->impl );
+    free( pub );
+}
+
+const char *x264_gpu_la_name( void *ctx )
+{
+    gpu_la_pub_t *pub = (gpu_la_pub_t*)ctx;
+    return pub ? pub->be->name() : "";
+}
+
+const char *x264_gpu_la_backend_id( void *ctx )
+{
+    gpu_la_pub_t *pub = (gpu_la_pub_t*)ctx;
+    return pub ? pub->be->name_id : "";
+}
+
+int x264_gpu_la_intra( void *ctx, const void *base, int base_off, int stride, int rows,
+                       int b_satd, int *out )
+{
+    gpu_la_pub_t *pub = (gpu_la_pub_t*)ctx;
+    if( !pub )
+        return -1;
+    return pub->be->intra( pub->impl, base, base_off, stride, rows, b_satd, out );
+}
+
+uint16_t *x264_gpu_la_table( void *ctx, const void *fenc_base, int fenc_off, int fenc_stride,
+                             const void *ref_base, int ref_off, int ref_stride, int rows, int R,
+                             int b_satd )
+{
+    gpu_la_pub_t *pub = (gpu_la_pub_t*)ctx;
+    if( !pub )
+        return NULL;
+    return pub->be->table( pub->impl, fenc_base, fenc_off, fenc_stride,
+                           ref_base, ref_off, ref_stride, rows, R, b_satd );
 }
