@@ -815,3 +815,109 @@ extern "C" __global__ void la_table_10( const uint16_t *__restrict__ fbuf, int f
     la_table_impl( fbuf, foff, rbuf, roff, fstride, rstride, mbw, mbh, R, b_satd, out );
 }
 
+/* --- fast-mode lookahead search ------------------------------------------
+ * One thread per 8x8 lowres block runs a deterministic hierarchical
+ * integer-pel search and writes { int16 mvx, int16 mvy, uint16 sad, pad }.
+ * The CPU re-evaluates the proposed vector with its real cost function and
+ * skips its own pattern search, so only the decision origin changes (the
+ * output differs from the CPU lookahead, like the stock --opencl path, but
+ * stays deterministic).  The per-block search window mirrors the CPU's
+ * mv_limit_fpel exactly, so the proposal is always in range and the plane
+ * reads stay inside the padding. */
+
+template<class P>
+__device__ __forceinline__ int la_sad8_raw( const P *f, int fs, const P *r, int rs )
+{
+    int s = 0;
+#pragma unroll
+    for( int j = 0; j < 8; j++ )
+#pragma unroll
+        for( int i = 0; i < 8; i++ )
+        {
+            int d = (int)f[j * fs + i] - (int)r[j * rs + i];
+            s += d < 0 ? -d : d;
+        }
+    return s;
+}
+
+/* 16-sample (2x subsampled) SAD for the coarse level */
+template<class P>
+__device__ __forceinline__ int la_sad16s_raw( const P *f, int fs, const P *r, int rs )
+{
+    int s = 0;
+#pragma unroll
+    for( int j = 0; j < 4; j++ )
+#pragma unroll
+        for( int i = 0; i < 4; i++ )
+        {
+            int d = (int)f[2 * j * fs + 2 * i] - (int)r[2 * j * rs + 2 * i];
+            s += d < 0 ? -d : d;
+        }
+    return s;
+}
+
+template<class P>
+__device__ __forceinline__ void la_search_impl( const P *__restrict__ fbuf, int foff,
+                                                const P *__restrict__ rbuf, int roff,
+                                                int fstride, int rstride,
+                                                int mbw, int mbh, int flo, int fhi,
+                                                uint16_t *__restrict__ out )
+{
+    int mb = blockIdx.x * blockDim.x + threadIdx.x;
+    if( mb >= mbw * mbh )
+        return;
+    int mx = mb % mbw, my = mb / mbw;
+    const P *f = fbuf + foff + (size_t)my * 8 * fstride + mx * 8;
+    const P *r0 = rbuf + roff + (size_t)my * 8 * rstride + mx * 8;
+    /* same window as slicetype_mb_cost's mv_limit_fpel */
+    int xlo = gpu_max( -8 * mx - 12, flo ), xhi = gpu_min( 8 * (mbw - mx - 1) + 12, fhi );
+    int ylo = gpu_max( -8 * my - 12, flo ), yhi = gpu_min( 8 * (mbh - my - 1) + 12, fhi );
+    int bsad, bdx = 0, bdy = 0;
+    /* L1: step-4 grid, 16-sample SAD */
+    bsad = 0x7fffffff;
+    for( int dy = ylo; dy <= yhi; dy += 4 )
+        for( int dx = xlo; dx <= xhi; dx += 4 )
+        {
+            int s = la_sad16s_raw<P>( f, fstride, r0 + (size_t)dy * rstride + dx, rstride );
+            if( s < bsad ) { bsad = s; bdx = dx; bdy = dy; }
+        }
+    /* L2: +-2 refine around the L1 winner, full 8x8 SAD */
+    bsad = 0x7fffffff;
+    for( int dy = gpu_max( ylo, bdy - 2 ); dy <= gpu_min( yhi, bdy + 2 ); dy++ )
+        for( int dx = gpu_max( xlo, bdx - 2 ); dx <= gpu_min( xhi, bdx + 2 ); dx++ )
+        {
+            int s = la_sad8_raw<P>( f, fstride, r0 + (size_t)dy * rstride + dx, rstride );
+            if( s < bsad ) { bsad = s; bdx = dx; bdy = dy; }
+        }
+    /* L3: +-1 refine */
+    for( int dy = gpu_max( ylo, bdy - 1 ); dy <= gpu_min( yhi, bdy + 1 ); dy++ )
+        for( int dx = gpu_max( xlo, bdx - 1 ); dx <= gpu_min( xhi, bdx + 1 ); dx++ )
+        {
+            int s = la_sad8_raw<P>( f, fstride, r0 + (size_t)dy * rstride + dx, rstride );
+            if( s < bsad ) { bsad = s; bdx = dx; bdy = dy; }
+        }
+    uint16_t *o = out + (size_t)mb * 4;
+    o[0] = (uint16_t)(int16_t)bdx;
+    o[1] = (uint16_t)(int16_t)bdy;
+    o[2] = (uint16_t)bsad;
+    o[3] = 0;
+}
+
+extern "C" __global__ void la_search( const uint8_t *__restrict__ fbuf, int foff,
+                                      const uint8_t *__restrict__ rbuf, int roff,
+                                      int fstride, int rstride,
+                                      int mbw, int mbh, int flo, int fhi,
+                                      uint16_t *__restrict__ out )
+{
+    la_search_impl( fbuf, foff, rbuf, roff, fstride, rstride, mbw, mbh, flo, fhi, out );
+}
+
+extern "C" __global__ void la_search_10( const uint16_t *__restrict__ fbuf, int foff,
+                                         const uint16_t *__restrict__ rbuf, int roff,
+                                         int fstride, int rstride,
+                                         int mbw, int mbh, int flo, int fhi,
+                                         uint16_t *__restrict__ out )
+{
+    la_search_impl( fbuf, foff, rbuf, roff, fstride, rstride, mbw, mbh, flo, fhi, out );
+}
+

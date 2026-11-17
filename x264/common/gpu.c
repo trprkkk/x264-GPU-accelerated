@@ -298,3 +298,14 @@ uint16_t *x264_gpu_la_table( void *ctx, const void *fenc_base, int fenc_off, int
     return pub->be->table( pub->impl, fenc_base, fenc_off, fenc_stride,
                            ref_base, ref_off, ref_stride, rows, R, b_satd );
 }
+
+uint16_t *x264_gpu_la_search( void *ctx, const void *fenc_base, int fenc_off, int fenc_stride,
+                              const void *ref_base, int ref_off, int ref_stride, int rows,
+                              int flo, int fhi )
+{
+    gpu_la_pub_t *pub = (gpu_la_pub_t*)ctx;
+    if( !pub || !pub->be->search )
+        return NULL;
+    return pub->be->search( pub->impl, fenc_base, fenc_off, fenc_stride,
+                            ref_base, ref_off, ref_stride, rows, flo, fhi );
+}

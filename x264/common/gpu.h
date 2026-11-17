@@ -176,6 +176,15 @@ typedef struct x264_gpu_la_backend_t
     uint16_t *(*table)( void *ctx, const void *fenc_base, int fenc_off, int fenc_stride,
                         const void *ref_base, int ref_off, int ref_stride, int rows, int R,
                         int b_satd );
+    /* Fast mode only: propose an integer-pel start vector per MB from a
+     * deterministic hierarchical search.  out[mb*4..] = { int16 mvx, int16
+     * mvy, uint16 sad, pad }.  flo/fhi are the frame-level full-pel MV range
+     * (matching the CPU's mv_limit_fpel edges).  Returns the host buffer or
+     * NULL on failure (the CPU then runs its own search).  The buffer stays
+     * valid until the next search call on the same context slot. */
+    uint16_t *(*search)( void *ctx, const void *fenc_base, int fenc_off, int fenc_stride,
+                         const void *ref_base, int ref_off, int ref_stride, int rows,
+                         int flo, int fhi );
 } x264_gpu_la_backend_t;
 
 /* Backend instances (defined in gpu_cuda.cpp / gpu_cl.c). */
@@ -193,6 +202,9 @@ int   x264_gpu_la_intra( void *ctx, const void *base, int base_off, int stride, 
 uint16_t *x264_gpu_la_table( void *ctx, const void *fenc_base, int fenc_off, int fenc_stride,
                              const void *ref_base, int ref_off, int ref_stride, int rows, int R,
                              int b_satd );
+uint16_t *x264_gpu_la_search( void *ctx, const void *fenc_base, int fenc_off, int fenc_stride,
+                              const void *ref_base, int ref_off, int ref_stride, int rows,
+                              int flo, int fhi );
 
 #ifdef __cplusplus
 }

@@ -1005,4 +1005,5 @@ extern const x264_gpu_la_backend_t x264_gpu_la_backend_cl =
     NULL,
     NULL,
     NULL,
+    NULL,
 };

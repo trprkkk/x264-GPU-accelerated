@@ -587,6 +587,34 @@ static void gpu_la_prep_table( x264_t *h, x264_frame_t *fenc, x264_frame_t *ref,
     }
     /* On failure the slot stays NULL: the CPU search runs as usual. */
 }
+
+/* Fast mode (--gpu-lookahead 2): instead of the exhaustive exact-mode table,
+ * the GPU proposes an integer-pel start vector per MB from a deterministic
+ * hierarchical search; the CPU re-evaluates it with its real cost function
+ * and skips its own pattern search. */
+static void gpu_la_prep_search( x264_t *h, x264_frame_t *fenc, x264_frame_t *ref,
+                                int list, int dist, const x264_weight_t *w )
+{
+    const void *rbase = ref->buffer_lowres;
+    int roff = PADH_ALIGN + PADV * ref->i_stride_lowres;
+    int rstride = ref->i_stride_lowres;
+    if( list == 0 && w && w[0].weightfn )
+    {
+        /* me_search compares against the scaled lowres plane in this case */
+        rbase = h->mb.p_weight_buf[0];
+    }
+    int mv_range = 2 * h->param.analyse.i_mv_range;
+    int flo = ( -mv_range ) >> 2;        /* fpel lower bound, as mv_limit_fpel */
+    int fhi = ( mv_range - 1 ) >> 2;     /* fpel upper bound */
+    int rows = h->mb.i_mb_height * 8 + 2 * PADV;
+    uint16_t *res = x264_gpu_la_search( h->gpu_la_ctx, fenc->buffer_lowres,
+                                        PADH_ALIGN + PADV * fenc->i_stride_lowres,
+                                        fenc->i_stride_lowres, rbase, roff, rstride,
+                                        rows, flo, fhi );
+    if( res )
+        fenc->gpu_la_fast[list][dist] = res;
+    /* On failure the slot stays NULL: the CPU search runs as usual. */
+}
 #endif
 
 static void slicetype_mb_cost( x264_t *h, x264_mb_analysis_t *a,
@@ -623,6 +651,7 @@ static void slicetype_mb_cost( x264_t *h, x264_mb_analysis_t *a,
      * own searches (i_list >= 0) ignore them entirely. */
     m[0].la_tab = m[1].la_tab = NULL;
     m[0].la_R = m[1].la_R = 0;
+    m[0].la_fast = m[1].la_fast = NULL;
     if( b != p0 && fenc->gpu_la_tab[0][b-p0-1] )
     {
         m[0].la_tab = fenc->gpu_la_tab[0][b-p0-1];
@@ -635,6 +664,10 @@ static void slicetype_mb_cost( x264_t *h, x264_mb_analysis_t *a,
         m[1].la_R = fenc->gpu_la_R;
         m[1].la_mboff = i_mb_xy * (2*m[1].la_R+1) * (2*m[1].la_R+1);
     }
+    if( b != p0 && fenc->gpu_la_fast[0][b-p0-1] )
+        m[0].la_fast = fenc->gpu_la_fast[0][b-p0-1] + (size_t)i_mb_xy * 4;
+    if( b_bidir && fenc->gpu_la_fast[1][p1-b-1] )
+        m[1].la_fast = fenc->gpu_la_fast[1][p1-b-1] + (size_t)i_mb_xy * 4;
 #endif
     /* A small, arbitrary bias to avoid VBV problems caused by zero-residual lookahead blocks. */
     int lowres_penalty = 4;
@@ -997,17 +1030,30 @@ static int slicetype_frame_cost( x264_t *h, x264_mb_analysis_t *a,
             dist_scale_factor = ( ((b-p0) << 8) + ((p1-p0) >> 1) ) / (p1-p0);
 
 #if HAVE_CUDA
-        /* GPU lookahead (exact mode): precompute what the CPU would compute
-         * pixel-by-pixel for this (fenc, ref) pass.  The weights must be
-         * analysed first (the table has to match the plane me_search will
-         * read).  Any failure leaves the corresponding part on the CPU. */
-        if( h->gpu_la_ctx && h->param.analyse.i_gpu_la == 1 )
+        /* GPU lookahead: precompute what the CPU would compute pixel-by-pixel
+         * for this (fenc, ref) pass.  exact mode (1) precomputes bit-identical
+         * intra costs and cost tables; fast mode (2) lets the GPU propose the
+         * integer-pel start vectors instead.  The weights must be analysed
+         * first (the tables have to match the plane me_search will read).
+         * Any failure leaves the corresponding part on the CPU. */
+        if( h->gpu_la_ctx && h->param.analyse.i_gpu_la )
         {
+            int i_la_mode = h->param.analyse.i_gpu_la;
             gpu_la_prep_intra( h, fenc );
             if( do_search[0] )
-                gpu_la_prep_table( h, fenc, frames[p0], 0, b-p0-1, w );
+            {
+                if( i_la_mode == 2 )
+                    gpu_la_prep_search( h, fenc, frames[p0], 0, b-p0-1, w );
+                else
+                    gpu_la_prep_table( h, fenc, frames[p0], 0, b-p0-1, w );
+            }
             if( do_search[1] )
-                gpu_la_prep_table( h, fenc, frames[p1], 1, p1-b-1, x264_weight_none );
+            {
+                if( i_la_mode == 2 )
+                    gpu_la_prep_search( h, fenc, frames[p1], 1, p1-b-1, x264_weight_none );
+                else
+                    gpu_la_prep_table( h, fenc, frames[p1], 1, p1-b-1, x264_weight_none );
+            }
         }
 #endif
 

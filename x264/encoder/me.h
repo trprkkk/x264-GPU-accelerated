@@ -56,8 +56,12 @@ typedef struct
      * (the slicetype lowres search); the encoder's own searches (i_list
      * >= 0) never touch these fields.  When la_tab is set, integer-pel SADs
      * come from the precomputed (2*la_R+1)^2 square around the block origin;
-     * positions outside it fall back to the CPU SAD. */
+     * positions outside it fall back to the CPU SAD.
+     * In fast mode (--gpu-lookahead 2) la_fast instead points at this MB's
+     * GPU search proposal { int16 mvx, int16 mvy, uint16 sad, pad }: the CPU
+     * evaluates it with the real cost and skips its own pattern search. */
     const uint16_t *la_tab;
+    const uint16_t *la_fast;
     int16_t la_R;
     int     la_mboff;   /* element offset of this MB's square inside la_tab */
 

@@ -338,6 +338,8 @@ void x264_frame_delete( x264_frame_t *frame )
 #if HAVE_CUDA
         x264_gpu_frame_free( (x264_gpu_frame_t*)frame->gpu_me );
         x264_free( frame->gpu_la_intra );
+        /* gpu_la_tab / gpu_la_fast point into the GPU backend's pinned result
+         * ring and are owned (and freed) by the lookahead context. */
 #endif
 #if HAVE_OPENCL
         x264_opencl_frame_delete( frame );
@@ -811,6 +813,7 @@ x264_frame_t *x264_frame_pop_unused( x264_t *h, int b_fdec )
     frame->gpu_la_intra = NULL;
     frame->gpu_la_R = 0;
     memset( frame->gpu_la_tab, 0, sizeof( frame->gpu_la_tab ) );
+    memset( frame->gpu_la_fast, 0, sizeof( frame->gpu_la_fast ) );
 #endif
 
     return frame;

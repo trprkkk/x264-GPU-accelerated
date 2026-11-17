@@ -408,7 +408,24 @@ static void me_search_ref_internal( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], 
     }
 #endif
 
-    if( b_gpu_fpel != 3 )
+    /* Lookahead fast mode (--gpu-lookahead 2): the GPU's hierarchical search
+     * proposes the integer-pel start point.  The CPU evaluates it with the
+     * real cost function and skips its own pattern search; the subpel refine,
+     * bidir and every other decision stay on the CPU.  The proposal is inside
+     * this MB's mv_limit by construction, but the check is cheap. */
+    int b_la_fast = 0;
+    if( m->i_list < 0 && m->la_fast )
+    {
+        int mx = (int)(int16_t)m->la_fast[0];
+        int my = (int)(int16_t)m->la_fast[1];
+        if( CHECK_MVRANGE( mx, my ) )
+        {
+            COST_MV( mx, my );
+            b_la_fast = 1;
+        }
+    }
+
+    if( b_gpu_fpel != 3 && !b_la_fast )
     switch( h->mb.i_me_method )
     {
         case X264_ME_DIA:

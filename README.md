@@ -50,7 +50,7 @@ x264 はフレームタイプ (I/P/B) や MB ツリーの決定に**低解像度
 |---|---|---|
 | `0` | GPU オフ (既定) | 従来と同じ。ビット一致 |
 | `1` | **exact モード**: GPU が CPU が計算するはずの値をビット単位で同じに先計算し、CPU 探索はテーブルを参照 | 出力を一切変えずにルックアヘッドの SAD/SATD 計算を GPU へオフロード |
-| `2` | fast モード (GPU が判断も行う) | **未実装**。指定すると警告を出して CPU にフォールバックします |
+| `2` | **fast モード (実験的)**: GPU が階層探索で整数精度の起点ベクトルを提案し、CPU はそれを本物のコストで評価してパターン探索を省略 | exhaustive テーブルの代償を払わない実用モード。出力は CPU ルックアヘッドと**異なる** (本家 `--opencl` と同様) が、決定的 |
 
 exact モードの契約:
 
@@ -65,6 +65,19 @@ exact モードの契約:
   ビデオ内容の符号化判断は同一)。未指定時の出力は従来とビット一致です。
 - 本家 x264 の `--opencl` (OpenCL lookahead) は**別機能**で、本フォークでも
   元のまま維持しています。両者は独立で、同時指定は推奨しません。
+
+fast モード (`--gpu-lookahead 2`) の契約:
+
+- GPU が MB ごとに階層探索 (±範囲を 4px グリッドの 16 サンプル SAD で大まかに
+  ランキング → 全 8x8 SAD で ±2/±1 にリファイン) で整数精度の起点ベクトルを
+  提案します。探索窓は CPU の `mv_limit_fpel` と同じ式でクランプされます。
+- CPU は提案ベクトルを**本物のコスト関数** (fpelcmp + λ·MV コスト) で評価して
+  採否を決め、自分のパターン探索 (hex) だけを省略します。サブペル refine、
+  bidir、skip 判定、intra 比較はすべて元の x264 のままです。
+- 出力は CPU ルックアヘッドと一致しません (判断の起点が変わるため) が、
+  **同一入力・同一設定の反復実行でバイト単位で同一**の決定的な結果になり、
+  `--lookahead-threads` にも依存しません。GPU 失敗時はその MB の探索が
+  通常の CPU 経路に落ちます (出力は決定的のまま)。
 
 ---
 
@@ -192,7 +205,7 @@ x264 --preset slow --crf 23 --gpu-me 2 input.yuv --input-res 1280x720 -o out.264
 | `--gpu-me-radius <int>` | `2` | 粗探索候補周辺の全解像度リファイン半径 (0〜8) |
 | `--gpu-me-refs <int>` | `2` | GPU 解析する参照フレーム数 (0 = すべて、最大 4) |
 | `--gpu-me-device <int>` | `0` | GPU デバイス番号 |
-| `--gpu-lookahead <0-2>` | `0` | GPU ルックアヘッド (低解像度解析) モード: 0=オフ、1=exact (CPU 同一判断保証)、2=fast (未実装。CPU フォールバック) |
+| `--gpu-lookahead <0-2>` | `0` | GPU ルックアヘッド (低解像度解析) モード: 0=オフ、1=exact (CPU 同一判断保証)、2=fast (実験的。GPU 提案ベクトルで探索短縮、出力は CPU と異なるが決定的) |
 
 ### 推奨構成
 
@@ -380,9 +393,10 @@ x264 [warning]: GPU lookahead: no usable GPU backend, falling back to CPU
 | GPU モードの再現性 (同一入力・同一設定) | ✅ mode 1/2/3 の反復実行が SHA-1 一致 (240 frames placebo) |
 | フレームタイプ決定が GPU モードに依存しない | ✅ `--gpu-me 0/1/2/3` で I/P/B 列が完全一致、stock とも一致 (240 frames placebo) |
 | **GPU lookahead (exact モード) のビット一致** | ✅ `--gpu-lookahead 1` (60f 720p CRF23 threads1 `--gpu-me 0`): medium `6A50DA31…` / ultrafast `624677FE…` / superfast `EBE94973…` / veryslow `86D27CA7…` / placebo `52A6DBFD…` が、テーブルを一切使わない all-CPU 実行 (`X264_GPU_LA_SKIP` 相当) と SHA-1 完全一致。placebo (TESA→`fpelcmp`=SATD) はテーブル側も SATD を計算して一致 |
+| **GPU lookahead (fast モード) の決定性** | ✅ `--gpu-lookahead 2` (placebo / medium 60f 720p、10-bit、`--lookahead-threads 2`) の反復実行が SHA-1 完全一致。threads 2 でも 1 スレッドと同一ハッシュ (スライス分割非依存)。同一 CRF の出力サイズは CPU ルックアヘッド比 −0.4〜−2.2% (効率ほぼ同等) |
 | GPU lookahead のテーブル照合 | ✅ f1 の全 15,210,000 エントリ (720p, R=32) が CPU の `fpelcmp[8x8]` と 0 ミスマッチ。intra カーネルも 0/3600 ミスマッチ (複数フレーム) |
-| GPU lookahead × `--lookahead-threads 2` | ✅ medium / placebo とも 1 スレッド結果と同一ハッシュ |
-| GPU lookahead × 10-bit | ✅ medium `D0E5BD4F…` / placebo `C267975F…` が all-CPU 実行とビット一致 (10-bit SATD カーネル含む) |
+| GPU lookahead × `--lookahead-threads 2` | ✅ medium / placebo とも 1 スレッド結果と同一ハッシュ (exact / fast とも) |
+| GPU lookahead × 10-bit | ✅ medium `D0E5BD4F…` / placebo `C267975F…` が all-CPU 実行とビット一致 (10-bit SATD カーネル含む)。fast モードも 10-bit で決定的 (`EF87142A…`) |
 | GPU lookahead × GPU ME 同時使用 | ✅ `--gpu-me 2 --gpu-lookahead 1` で LA 部分のみ GPU/CPU を切り替えても同一ハッシュ (`D383AF1E…`) |
 | `--gpu-lookahead` 未指定時の不変条件 | ✅ g0 = `BEB55C36…`、m2 = `965066A7…`、m3 = `B3090B30…`、OpenCL m2 は全て従来値を維持 (オプション追加による出力変化なし) |
 | NVENC (固定機能) との画質比較 | ✅ 5 レート帯すべてで少ないビットで高 SSIM/PSNR (BD-rate −33.6% / −40.7%) |
@@ -484,6 +498,22 @@ x264_slicetype_frame_cost()                [encoder/slicetype.c]
 - OpenCL バックエンドの lookahead 実装は未移植です (CUDA 専用。OpenCL のみ
   の環境では GPU lookahead は CPU にフォールバックします)。
 
+fast モード (`--gpu-lookahead 2`) の処理フロー:
+
+```
+x264_slicetype_frame_cost()
+  ├─ gpu_la_prep_intra()                     exact モードと共通 (ビット一致)
+  ├─ gpu_la_prep_search()                    (fenc, ref, dist) ごとに la_search
+  │                                          カーネル: 1 MB 1 スレッドで階層探索
+  │                                          (L1: 4px グリッド ×16 サンプル SAD、
+  │                                           L2/L3: 全 8x8 SAD で ±2/±1)。
+  │                                          探索窓は CPU の mv_limit_fpel と同一式
+  └─ slicetype_mb_cost() → me_search()
+      ├─ GPU 提案ベクトルを COST_MV で本物のコスト評価 (CHECK_MVRANGE 保険付き)
+      ├─ パターン探索 (hex) を省略
+      └─ bpred/0 ベクトル評価・skip 判定・subpel refine・bidir は元の x264 のまま
+```
+
 ### バックエンド (CUDA / OpenCL)
 
 `common/gpu.c` が公開 API のディスパッチャで、`common/gpu.cu` (CUDA) と
@@ -557,7 +587,7 @@ x264_slicetype_frame_cost()                [encoder/slicetype.c]
 | `encoder/me.c` | GPU 候補の注入 (mode 1/2/3/4)。`i_list >= 0` を必須条件とする |
 | `encoder/slicetype.c` | ルックアヘッドの低解像度 ME に `i_list = -1` を設定し、GPU 候補の注入対象外にする |
 | `common/gpu.h` / `gpu.c` | ルックアヘッド用 API (`x264_gpu_la_*`) とバックエンド・ディスパッチャ (`x264_gpu_la_backend_t`) |
-| `common/gpu_kernels.cu` | `la_intra(_10)` / `la_table(_10)` カーネル (intra 予測器・SATD/SAD を CPU 実装から正確に転写) |
+| `common/gpu_kernels.cu` | `la_intra(_10)` / `la_table(_10)` / `la_search(_10)` カーネル (intra 予測器・SATD/SAD・階層探索を CPU 実装から正確に転写) |
 | `common/gpu_cuda.cpp` | ルックアヘッド用 CUDA ホスト (ピン留めホストリング、平面転送、遅延 grow) |
 | `common/gpu_cl.c` | ルックアヘッドの OpenCL スタブ (未移植。available=0 で CPU フォールバック) |
 | `common/frame.h` / `frame.c` | フレームごとの `gpu_la_intra` / `gpu_la_tab` / `gpu_la_R` と `pop_unused` でのリセット |
@@ -584,12 +614,16 @@ x264_slicetype_frame_cost()                [encoder/slicetype.c]
 - **exact モード (`--gpu-lookahead 1`) は現状、ルックアヘッドが軽い設定では
   逆に遅くなります。** CPU 探索が評価する数十位置に対し、GPU は MB あたり
   (2R+1)² = 最大 4,225 位置のテーブルを事前計算するためです (60f 720p の
-  実測: medium 1.5s→6.4s、placebo 24.6s→58.7s)。テーブルは (fenc, ref, dist)
-  ごとに 1 回しか計算されず、ルックアヘッドが重い (パスを何度も回す) ワーク
-  ロードほど相対コストは下がりますが、速度目的であれば現時点では
-  `--gpu-me` のみの利用を推奨します。exact モードは「出力を一切変えずに
-  ルックアヘッドの計算を GPU に置換できる」ことの保証が主目的で、
-  速度を狙う fast モード (`--gpu-lookahead 2`、GPU が判断も行う) は今後の課題です。
+  実測: medium 1.5s→6.3s、1080p 5.0s→13.8s)。exact モードは「出力を一切
+  変えずにルックアヘッドの計算を GPU に置換できる」ことの保証が主目的です。
+- **fast モード (`--gpu-lookahead 2`) は exact のテーブル代償を解消しますが、
+  720p/1080p クラスでは CPU ルックアヘッドとほぼ互角です** (60f 実測:
+  medium 720p 1.5s(CPU)→2.2s(fast)、placebo 720p 25.3s→28.2s、medium 1080p
+  5.0s→6.0s)。ルックアヘッドの fpel 探索自体が SIMD で軽く、(fenc, ref) ペア
+  ごとの GPU 往復 (アップロード+同期) が上回るためです。fast モードの価値は
+  (1) exhaustive テーブルを持たない実用モードであること、(2) 決定的で
+  lookahead-threads にも依存しないこと、(3) 今後のパイプライン化・大解像度
+  ワークロード向けの土台であること、にあります。実際の高速化は今後の課題です。
 - **GPU lookahead の OpenCL 実装は未移植** (CUDA 専用)。OpenCL のみの環境では
   警告を出して CPU にフォールバックします。
 - **本家 `--opencl` (OpenCL lookahead) は変更していません。** 本フォークの

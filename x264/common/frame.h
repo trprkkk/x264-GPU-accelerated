@@ -74,9 +74,13 @@ typedef struct x264_frame
      * gpu_la_intra holds the raw per-MB intra cost (the minimum predictor
      * SATD/SAD before the depth shift and penalty), gpu_la_tab[l][dist] the
      * per-MB SAD square for one (fenc, ref) pair.  Both contain exactly the
-     * values the CPU path would compute; NULL means "use the CPU". */
+     * values the CPU path would compute; NULL means "use the CPU".
+     * gpu_la_fast[l][dist] (fast mode) instead holds the GPU's per-MB integer
+     * search proposals { int16 mvx, int16 mvy, uint16 sad, pad }, which the
+     * CPU re-evaluates with its real cost and refines. */
     int32_t  *gpu_la_intra;
     uint16_t *gpu_la_tab[2][X264_BFRAME_MAX+1];
+    uint16_t *gpu_la_fast[2][X264_BFRAME_MAX+1];
     int16_t   gpu_la_R;
 
     /* YUV buffer */

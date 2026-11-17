@@ -917,7 +917,7 @@ struct gpu_la_ctx_t
     int mbw, mbh;              /* lowres MB grid == full-resolution grid */
     int pxsz, maxpx;           /* bytes per pixel, max pixel value */
     CUmodule module;
-    CUfunction fn_intra, fn_table;
+    CUfunction fn_intra, fn_table, fn_search;
     cudaStream_t stream;
     CUcontext cu_ctx;
     CUdevice  cu_dev;
@@ -930,6 +930,9 @@ struct gpu_la_ctx_t
     uint16_t *h_tab[GPU_LA_TAB_SLOTS];
     int tab_S;                 /* allocated square side (0 = none) */
     int tab_next;
+    uint16_t *d_fast;          /* fast-mode per-MB proposals (4 x uint16 / MB) */
+    uint16_t *h_fast[GPU_LA_TAB_SLOTS];
+    int fast_next;
 };
 
 static char gpu_la_name_buf[256] = "CUDA device";
@@ -940,8 +943,11 @@ static void gpu_la_cleanup( gpu_la_ctx_t *c )
     if( c->d_r ) cudaFree( c->d_r );
     if( c->d_intra ) cudaFree( c->d_intra );
     if( c->d_tab ) cudaFree( c->d_tab );
+    if( c->d_fast ) cudaFree( c->d_fast );
     for( int i = 0; i < GPU_LA_TAB_SLOTS; i++ )
         if( c->h_tab[i] ) cudaFreeHost( c->h_tab[i] );
+    for( int i = 0; i < GPU_LA_TAB_SLOTS; i++ )
+        if( c->h_fast[i] ) cudaFreeHost( c->h_fast[i] );
     if( c->stream ) cudaStreamDestroy( c->stream );
     if( c->module ) g_drv.cuModuleUnload( c->module );
     if( c->cu_retained ) g_drv.cuDevicePrimaryCtxRelease( c->cu_dev );
@@ -1027,6 +1033,7 @@ extern "C" void *x264_gpu_cuda_la_create( int mbw, int mbh, int device, int bit_
     }
     const char *ks_i = (bit_depth == 8) ? "la_intra"   : "la_intra_10";
     const char *ks_t = (bit_depth == 8) ? "la_table"   : "la_table_10";
+    const char *ks_s = (bit_depth == 8) ? "la_search"  : "la_search_10";
     if( g_drv.cuModuleGetFunction( &c->fn_intra, c->module, ks_i ) != CUDA_SUCCESS ||
         g_drv.cuModuleGetFunction( &c->fn_table, c->module, ks_t ) != CUDA_SUCCESS )
     {
@@ -1035,6 +1042,10 @@ extern "C" void *x264_gpu_cuda_la_create( int mbw, int mbh, int device, int bit_
         delete c;
         return NULL;
     }
+    /* fast-mode search is optional: without it --gpu-lookahead 2 falls back
+     * to the CPU lookahead, which is still deterministic */
+    if( g_drv.cuModuleGetFunction( &c->fn_search, c->module, ks_s ) != CUDA_SUCCESS )
+        c->fn_search = NULL;
     if( cudaStreamCreate( &c->stream ) != cudaSuccess ||
         cudaMalloc( (void**)&c->d_intra, (size_t)mbw * mbh * sizeof(int32_t) ) != cudaSuccess )
     {
@@ -1151,6 +1162,55 @@ fail:
     return NULL;
 }
 
+extern "C" uint16_t *x264_gpu_cuda_la_search( void *ctx, const void *fenc_base, int fenc_off,
+                                              int fenc_stride, const void *ref_base, int ref_off,
+                                              int ref_stride, int rows, int flo, int fhi )
+{
+    gpu_la_ctx_t *c = (gpu_la_ctx_t*)ctx;
+    if( !c || c->disabled || !c->fn_search || !fenc_base || !ref_base ||
+        rows < c->mbh * 8 || fenc_stride < c->mbw * 8 + 16 || ref_stride < c->mbw * 8 + 16 )
+        return NULL;
+    if( gpu_la_upload( c, &c->d_f, fenc_base, fenc_stride, rows ) < 0 )
+        goto fail;
+    if( gpu_la_upload( c, &c->d_r, ref_base, ref_stride, rows ) < 0 )
+        goto fail;
+    {
+        size_t bytes = (size_t)c->mbw * c->mbh * 4 * sizeof(uint16_t);
+        if( !c->d_fast )
+        {
+            if( cudaMalloc( (void**)&c->d_fast, bytes ) != cudaSuccess )
+                goto fail;
+            for( int i = 0; i < GPU_LA_TAB_SLOTS; i++ )
+                if( cudaMallocHost( (void**)&c->h_fast[i], bytes ) != cudaSuccess )
+                    goto fail;
+        }
+        int total = c->mbw * c->mbh;
+        void *args[11] =
+        {
+            (void*)&c->d_f, (void*)&fenc_off, (void*)&c->d_r, (void*)&ref_off,
+            (void*)&fenc_stride, (void*)&ref_stride,
+            (void*)&c->mbw, (void*)&c->mbh, (void*)&flo, (void*)&fhi, (void*)&c->d_fast
+        };
+        dim3 grid( (total + 255) / 256 ), block( 256 );
+        if( g_drv.cuLaunchKernel( c->fn_search, grid.x, 1, 1, block.x, 1, 1,
+                                  0, (CUstream)c->stream, args, NULL ) != CUDA_SUCCESS )
+            goto fail;
+        int slot = c->fast_next;
+        if( cudaMemcpyAsync( c->h_fast[slot], c->d_fast, bytes,
+                             cudaMemcpyDeviceToHost, c->stream ) != cudaSuccess )
+            goto fail;
+        if( cudaStreamSynchronize( c->stream ) != cudaSuccess )
+            goto fail;
+        c->fast_next = (slot + 1) % GPU_LA_TAB_SLOTS;
+        return c->h_fast[slot];
+    }
+
+fail:
+    cudaStreamSynchronize( c->stream );
+    c->disabled = 1;
+    return NULL;
+}
+
 extern "C" const x264_gpu_la_backend_t x264_gpu_la_backend_cuda =
 {
     X264_GPU_BACKEND_CUDA,
@@ -1161,6 +1221,7 @@ extern "C" const x264_gpu_la_backend_t x264_gpu_la_backend_cuda =
     x264_gpu_cuda_la_name,
     x264_gpu_cuda_la_intra,
     x264_gpu_cuda_la_table,
+    x264_gpu_cuda_la_search,
 };
 
 

@@ -1791,12 +1791,6 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
                       x264_gpu_backend_id( h->gpu_ctx ), x264_gpu_name( h->gpu_ctx ),
                       BIT_DEPTH );
     }
-    if( h->param.analyse.i_gpu_la == 2 )
-    {
-        /* Fast mode (GPU makes the lookahead decisions) is not wired up yet. */
-        x264_log( h, X264_LOG_WARNING, "GPU lookahead: fast mode is not available yet, falling back to CPU\n" );
-        h->param.analyse.i_gpu_la = 0;
-    }
     if( h->param.analyse.i_gpu_la && h->param.b_interlaced )
     {
         x264_log( h, X264_LOG_WARNING, "GPU lookahead: interlaced coding is not supported, falling back to CPU\n" );
@@ -1814,9 +1808,9 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
             h->param.analyse.i_gpu_la = 0;
         }
         else
-            x264_log( h, X264_LOG_INFO, "GPU lookahead: %s / %s (exact mode, %d-bit)\n",
+            x264_log( h, X264_LOG_INFO, "GPU lookahead: %s / %s (%s mode, %d-bit)\n",
                       x264_gpu_la_backend_id( h->gpu_la_ctx ), x264_gpu_la_name( h->gpu_la_ctx ),
-                      BIT_DEPTH );
+                      h->param.analyse.i_gpu_la == 2 ? "fast" : "exact", BIT_DEPTH );
     }
 #endif
 

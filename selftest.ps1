@@ -77,8 +77,9 @@ if( $log -match "GPU ME: \S+ / .+\(10-bit\)" ) { Write-Host "PASS: 10-bit encodi
 elseif( $log -match "GPU ME: no usable GPU backend" ) { Write-Host "WARN: no usable GPU backend, 10-bit ran on the CPU" -ForegroundColor Yellow }
 else { Write-Host "FAIL: 10-bit GPU acceleration missing" -ForegroundColor Red; $fail = 1 }
 
-# 3b) GPU lookahead (exact mode): runs cleanly, reports itself, and the
-#     reserved fast mode falls back to the CPU with a warning
+# 3b) GPU lookahead: exact mode runs and reports itself; fast mode (2) also
+#     runs (experimental: output differs from the CPU lookahead but is
+#     deterministic), and both are covered by the determinism battery below
 & $exe "--preset" "medium" "--gpu-me" "0" "--gpu-lookahead" "1" @common $yuv "-o" "testdata\st_la.264" 2> "testdata\st_la.log"
 $laLog = Get-Content "testdata\st_la.log" -Raw
 if( $LASTEXITCODE -eq 0 -and $laLog -match "GPU lookahead: \S+ / .+exact mode" )
@@ -90,11 +91,13 @@ if( $ff )
     if( $LASTEXITCODE -eq 0 ) { Write-Host "PASS: --gpu-lookahead 1 output decodes" -ForegroundColor Green }
     else { Write-Host "FAIL: --gpu-lookahead 1 output failed to decode" -ForegroundColor Red; $fail = 1 }
 }
-& $exe "--preset" "medium" "--gpu-me" "0" "--gpu-lookahead" "2" @common $yuv "-o" "NUL" 2> "testdata\st_la2.log"
+& $exe "--preset" "medium" "--gpu-me" "0" "--gpu-lookahead" "2" @common $yuv "-o" "testdata\st_laf.264" 2> "testdata\st_la2.log"
 $la2Log = Get-Content "testdata\st_la2.log" -Raw
-if( $la2Log -match "GPU lookahead: fast mode is not available yet" )
-    { Write-Host "PASS: --gpu-lookahead 2 warns and falls back to the CPU" -ForegroundColor Green }
-else { Write-Host "FAIL: fast-mode fallback warning missing" -ForegroundColor Red; $fail = 1 }
+if( $LASTEXITCODE -eq 0 -and $la2Log -match "GPU lookahead: \S+ / .+fast mode" )
+    { Write-Host "PASS: --gpu-lookahead 2 (fast mode) runs" -ForegroundColor Green }
+elseif( $la2Log -match "GPU lookahead: no usable GPU backend" )
+    { Write-Host "WARN: no usable GPU backend, fast mode ran on the CPU" -ForegroundColor Yellow }
+else { Write-Host "FAIL: --gpu-lookahead 2 (fast mode) failed (exit $LASTEXITCODE)" -ForegroundColor Red; $fail = 1 }
 
 # 4) determinism: repeated runs of the same GPU mode must be bit-identical
 $detCommon = @("--preset","slow","--crf","23","--threads","1","--frames","80","--input-res","1280x720","--fps","30")
@@ -107,6 +110,18 @@ foreach( $m in 1,2,3,4 )
     if( $ha -eq $hb ) { Write-Host "PASS: --gpu-me $m is deterministic across runs" -ForegroundColor Green }
     else              { Write-Host "FAIL: --gpu-me $m differs between runs ($ha vs $hb)" -ForegroundColor Red; $fail = 1 }
 }
+# 4b) fast-mode lookahead determinism (and slice-count independence)
+$detLA = @("--preset","medium","--crf","23","--threads","1","--gpu-me","0","--gpu-lookahead","2","--frames","80","--input-res","1280x720","--fps","30")
+& $exe @detLA $yuv "-o" "testdata\st_lad_a.264" 2> $null
+& $exe @detLA $yuv "-o" "testdata\st_lad_b.264" 2> $null
+$ha = (Get-FileHash "testdata\st_lad_a.264" -Algorithm SHA1).Hash
+$hb = (Get-FileHash "testdata\st_lad_b.264" -Algorithm SHA1).Hash
+if( $ha -eq $hb ) { Write-Host "PASS: --gpu-lookahead 2 (fast) is deterministic across runs" -ForegroundColor Green }
+else              { Write-Host "FAIL: fast-mode lookahead differs between runs ($ha vs $hb)" -ForegroundColor Red; $fail = 1 }
+& $exe @detLA "--lookahead-threads" "2" $yuv "-o" "testdata\st_lad_c.264" 2> $null
+$hc = (Get-FileHash "testdata\st_lad_c.264" -Algorithm SHA1).Hash
+if( $hc -eq $ha ) { Write-Host "PASS: fast-mode lookahead is independent of --lookahead-threads" -ForegroundColor Green }
+else              { Write-Host "FAIL: fast-mode lookahead differs with --lookahead-threads 2" -ForegroundColor Red; $fail = 1 }
 
 # 5) GPU candidate injection must not change the lookahead's frame-type
 #    decisions: the frame type sequence has to match mode 0 exactly
@@ -211,6 +226,7 @@ if( $fbLog -match "GPU ME: cuda" )
 else { Write-Host "SKIP: CUDA backend is not the initial backend, cannot verify fallback" -ForegroundColor Yellow }
 
 Remove-Item testdata\st_*.264,testdata\st_10bit.log,testdata\st_gpu.log,testdata\st_la.log,testdata\st_la2.log,testdata\st_1080.log,testdata\st_stats.log,testdata\st_stats.log.mbtree,testdata\st.qpfile,testdata\st_ocl_a.log,testdata\st_ocl_b.log,testdata\st_fb.log -ErrorAction SilentlyContinue
+
 
 if( $fail ) { Write-Host "SELFTEST FAILED" -ForegroundColor Red; exit 1 }
 Write-Host "ALL TESTS PASSED" -ForegroundColor Green
