@@ -64,7 +64,9 @@ exact モードの契約:
   入るため、未指定時の stock x264 とは**ハッシュが変わります** (ヘッダのみ。
   ビデオ内容の符号化判断は同一)。未指定時の出力は従来とビット一致です。
 - 本家 x264 の `--opencl` (OpenCL lookahead) は**別機能**で、本フォークでも
-  元のまま維持しています。両者は独立で、同時指定は推奨しません。
+  元のまま維持しています。両方を同時に指定した場合は、GPU lookahead を自動で
+  無効化して警告を表示します (stock の OpenCL lookahead が低解像度解析を
+  丸ごと置き換えるため、GPU lookahead の結果は使われないためです)。
 
 fast モード (`--gpu-lookahead 2`) の契約:
 
@@ -394,6 +396,9 @@ x264 [warning]: GPU lookahead: no usable GPU backend, falling back to CPU
 | フレームタイプ決定が GPU モードに依存しない | ✅ `--gpu-me 0/1/2/3` で I/P/B 列が完全一致、stock とも一致 (240 frames placebo) |
 | **GPU lookahead (exact モード) のビット一致** | ✅ `--gpu-lookahead 1` (60f 720p CRF23 threads1 `--gpu-me 0`): medium `6A50DA31…` / ultrafast `624677FE…` / superfast `EBE94973…` / veryslow `86D27CA7…` / placebo `52A6DBFD…` が、テーブルを一切使わない all-CPU 実行 (`X264_GPU_LA_SKIP` 相当) と SHA-1 完全一致。placebo (TESA→`fpelcmp`=SATD) はテーブル側も SATD を計算して一致 |
 | **GPU lookahead (fast モード) の決定性** | ✅ `--gpu-lookahead 2` (placebo / medium 60f 720p、10-bit、`--lookahead-threads 2`) の反復実行が SHA-1 完全一致。threads 2 でも 1 スレッドと同一ハッシュ (スライス分割非依存)。同一 CRF の出力サイズは CPU ルックアヘッド比 −0.4〜−2.2% (効率ほぼ同等) |
+| **GPU lookahead (fast モード) の品質** | ✅ x264 内蔵 `--psnr --ssim` (60f 720p CRF23): placebo で SSIM_Y 0.993099 (CPU 0.992921) / PSNR 48.77 dB (CPU 48.63)、medium で SSIM_Y 0.992907 (CPU 0.992817) / PSNR 48.62 dB (CPU 48.53)。CPU ルックアヘッドと同等〜わずかに良好 |
+| GPU lookahead のプロファイラ | ✅ `X264_GPU_LA_PROF=1` で GPU 準備 / CPU 探索の内訳を表示 (出力はビット不変) |
+| `--opencl` 併用時 | ✅ GPU lookahead を自動無効化して警告 (stock の OpenCL lookahead を維持) |
 | GPU lookahead のテーブル照合 | ✅ f1 の全 15,210,000 エントリ (720p, R=32) が CPU の `fpelcmp[8x8]` と 0 ミスマッチ。intra カーネルも 0/3600 ミスマッチ (複数フレーム) |
 | GPU lookahead × `--lookahead-threads 2` | ✅ medium / placebo とも 1 スレッド結果と同一ハッシュ (exact / fast とも) |
 | GPU lookahead × 10-bit | ✅ medium `D0E5BD4F…` / placebo `C267975F…` が all-CPU 実行とビット一致 (10-bit SATD カーネル含む)。fast モードも 10-bit で決定的 (`EF87142A…`) |
@@ -627,8 +632,9 @@ x264_slicetype_frame_cost()
 - **GPU lookahead の OpenCL 実装は未移植** (CUDA 専用)。OpenCL のみの環境では
   警告を出して CPU にフォールバックします。
 - **本家 `--opencl` (OpenCL lookahead) は変更していません。** 本フォークの
-  `--gpu-lookahead` は独立した機能で、`--opencl` とは併用しないでください
-  (両方が低解像度解析に介入します)。
+  `--gpu-lookahead` は独立した機能です。`--opencl` と同時に指定した場合は
+  GPU lookahead を自動で無効化し、警告を表示します (OpenCL lookahead が
+  低解像度解析を置き換えるため)。
 - **x265/HEVC 版は未収録**。本フォークは x264 (H.264) のみです。
 - **OpenCL バックエンドは NVIDIA 実機のみ検証済み**。カーネルはポータブルな
   OpenCL C 1.2 の範囲のみ使用していますが、AMD/Intel 実機での検証は未実施です。
@@ -646,6 +652,35 @@ x264_slicetype_frame_cost()
   増え (+20% の ME 呼び出し)、実測で最大 −8% の逆効果でした (詳細:
   `bench-results/prune-experiment.txt`)。速度は既存の全体ノブ (mode 2 の
   探索半径、mode 3 のフルペル省略) で調整します。
+
+### 性能の現状と残された高速化余地 (実測)
+
+`X264_ME_PROF` / `X264_GPU_LA_PROF` による内訳 (60f 720p、`--threads 1`):
+
+| ケース | エンコード | ME (サブペル含む) | ルックアヘッド | 備考 |
+|---|---|---|---|---|
+| placebo `--gpu-me 0` | 33.1 s | 25.7 s (**77.6%**) | ~4.6 s (14%) | ME 支配 |
+| placebo `--gpu-me 3` | 26.8 s | 20.3 s (76.0%) | ~4.6 s | ME −21% |
+| tesa24 `--gpu-me 0` | 3.3 s | 2.45 s (**74.2%**) | — | |
+| tesa24 `--gpu-me 3` | 2.5 s | 1.55 s (61.7%) | — | ME **−37%** |
+| umh24 `--gpu-me 0` | 2.0 s | 1.19 s (59.5%) | — | |
+| umh24 `--gpu-me 2` | 2.2 s | 1.23 s (55.8%) | — | 候補追加のオーバーヘッド |
+
+- **高圧縮プリセットのコストは ME (特にサブペル refine) が支配的**です。
+  gpu-me 3 はフルペル探索を省略して placebo −21% / tesa24 −37% を達成しますが、
+  その後に残る hpel/qpel refine (placebo は hpel 4 + qpel 10 反復) と RDO は
+  CPU 側のままです。さらに速度を伸ばすにはサブペル refine の GPU 化が必要で、
+  補間・RDO 統合を含む大規模な取り組みになります (現行の候補生成方式では
+  これ以上の大きな短縮は見込めません)。
+- **GPU lookahead の内訳**: fast モードの GPU 準備は 1.2 ms/パス、CPU パスは
+  1.5 ms/パス。GPU が置換できるのはパスあたり ~0.25 ms (fpel 探索) のみで、
+  サブペル refine・bidir・skip/intra 判定が CPU 側の大半を占めます。
+  ルックアヘッド自体も placebo で全体の ~14%、medium では数 % に過ぎないため、
+  fast モードの更なる最適化 (往復のパイプライン化やサブペルまでの GPU 化) の
+  上限は placebo で 1 s 程度 (全体の 3〜4%) と見積もられます。
+- **メモリ**: GPU lookahead の追加使用量は CUDA コンテキスト + 平面で約
+  +110 MB (exact はテーブル + 約 60 MB)、フレーム数に対する増加は CPU のみの
+  実行と同程度 (60f→240f で +33/+35 MB) で、リークはありません。
 
 ---
 
@@ -739,6 +774,10 @@ X264_GPU_TIMING=1 x264 --preset slow --crf 23 --gpu-me 1 input.yuv ... -o out.26
 X264_ME_PROF=1 x264 --preset slow --crf 23 --gpu-me 0 input.yuv ... -o out.264
 # モーションサーチ (サブペル含む) の合計時間とエンコード内シェアを表示します
 # (--threads 1 での計測用)
+
+X264_GPU_LA_PROF=1 x264 --preset slow --crf 23 --gpu-lookahead 2 input.yuv ... -o out.264
+# GPU lookahead の GPU 準備 (イントラ/テーブル/探索) と CPU 探索の内訳を表示します
+# (--threads 1 での計測用。ペアごとの GPU 往復コストの見積りに使えます)
 
 X264_GPU_PROF=1 x264 --preset slow --crf 23 --gpu-me 2 input.yuv ... -o out.264
 # x264_gpu_analyze*() の実呼び出し時間と、先出し解析の待ち時間を表示します

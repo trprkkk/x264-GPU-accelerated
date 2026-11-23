@@ -76,6 +76,9 @@ void x264_me_search_ref( x264_t *h, x264_me_t *m, int16_t (*mvc)[2], int i_mvc, 
 /* Optional motion-search profiler (X264_ME_PROF=1); prints at encoder close. */
 #define x264_me_prof_print x264_template(me_prof_print)
 void x264_me_prof_print( void );
+/* Optional GPU-lookahead profiler (X264_GPU_LA_PROF=1); prints at close. */
+#define x264_gpu_la_prof_print x264_template(gpu_la_prof_print)
+void x264_gpu_la_prof_print( void );
 #define x264_me_search( h, m, mvc, i_mvc )\
     x264_me_search_ref( h, m, mvc, i_mvc, NULL )
 

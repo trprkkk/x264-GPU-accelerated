@@ -1791,6 +1791,14 @@ x264_t *x264_encoder_open( x264_param_t *param, void *api )
                       x264_gpu_backend_id( h->gpu_ctx ), x264_gpu_name( h->gpu_ctx ),
                       BIT_DEPTH );
     }
+    if( h->param.analyse.i_gpu_la && h->param.b_opencl )
+    {
+        /* The stock OpenCL lookahead replaces the CPU lowres analysis path
+         * wholesale, so the GPU lookahead results would never be consumed.
+         * Disable it instead of paying for the prep calls. */
+        x264_log( h, X264_LOG_WARNING, "GPU lookahead: the stock --opencl lookahead is enabled, disabling GPU lookahead\n" );
+        h->param.analyse.i_gpu_la = 0;
+    }
     if( h->param.analyse.i_gpu_la && h->param.b_interlaced )
     {
         x264_log( h, X264_LOG_WARNING, "GPU lookahead: interlaced coding is not supported, falling back to CPU\n" );
@@ -4933,6 +4941,9 @@ void    x264_encoder_close  ( x264_t *h )
     x264_gpu_la_destroy( gpu_la_ctx );
 #endif
     x264_me_prof_print();
+#if HAVE_CUDA
+    x264_gpu_la_prof_print();
+#endif
 #if HAVE_OPENCL
     x264_opencl_close_library( ocl );
 #endif

@@ -516,6 +516,67 @@ void x264_weights_analyse( x264_t *h, x264_frame_t *fenc, x264_frame_t *ref, int
 #define ROW_SATD (NUM_INTS + (h->mb.i_mb_y - h->i_threadslice_start))
 
 #if HAVE_CUDA
+/* --- optional GPU-lookahead profiler -------------------------------------
+ * X264_GPU_LA_PROF=1 makes the encoder print, at close, the wall time spent
+ * in the GPU lookahead prep calls (intra + table/search uploads and kernels,
+ * i.e. the GPU-visible part) and in the per-pass lowres search loops (the
+ * CPU part), plus their share of the lookahead span.  Intended for
+ * --threads 1 runs: it sizes how much headroom pipelining the per-pair GPU
+ * roundtrip could recover. */
+#if !defined(_WIN32)
+#include <time.h>
+#endif
+
+static double x264_gpu_la_prof_now( void )
+{
+#if defined(_WIN32)
+    LARGE_INTEGER t, f;
+    QueryPerformanceFrequency( &f );
+    QueryPerformanceCounter( &t );
+    return (double)t.QuadPart / (double)f.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#endif
+}
+
+static double  x264_gpu_la_prof_first, x264_gpu_la_prof_last;
+static double  x264_gpu_la_prof_prep, x264_gpu_la_prof_pass;
+static int64_t x264_gpu_la_prof_preps, x264_gpu_la_prof_passes;
+static int     x264_gpu_la_prof_enabled = -1;
+
+static int x264_gpu_la_prof_init( void )
+{
+    if( x264_gpu_la_prof_enabled < 0 )
+        x264_gpu_la_prof_enabled = getenv( "X264_GPU_LA_PROF" ) != NULL;
+    return x264_gpu_la_prof_enabled;
+}
+
+static void x264_gpu_la_prof_record( double t0, double t1, double *acc, int64_t *calls )
+{
+    if( !x264_gpu_la_prof_preps && !x264_gpu_la_prof_passes )
+        x264_gpu_la_prof_first = t0;
+    x264_gpu_la_prof_last = t1;
+    *acc += t1 - t0;
+    (*calls)++;
+}
+
+void x264_gpu_la_prof_print( void )
+{
+    if( x264_gpu_la_prof_enabled != 1 || (!x264_gpu_la_prof_preps && !x264_gpu_la_prof_passes) )
+        return;
+    double span = x264_gpu_la_prof_last - x264_gpu_la_prof_first;
+    printf( "x264 GPU-LA profile: prep %.3f s over %lld passes, CPU search %.3f s over %lld passes",
+            x264_gpu_la_prof_prep, (long long)x264_gpu_la_prof_preps,
+            x264_gpu_la_prof_pass, (long long)x264_gpu_la_prof_passes );
+    if( span > 0.0 )
+        printf( " (lookahead span %.3f s: GPU %.1f%%, CPU %.1f%%)",
+                span, 100.0 * x264_gpu_la_prof_prep / span,
+                100.0 * x264_gpu_la_prof_pass / span );
+    printf( "\n" );
+}
+
 /* GPU lookahead (exact mode) helpers.
  *
  * The GPU precomputes exactly the values the CPU lookahead would compute
@@ -1039,6 +1100,8 @@ static int slicetype_frame_cost( x264_t *h, x264_mb_analysis_t *a,
         if( h->gpu_la_ctx && h->param.analyse.i_gpu_la )
         {
             int i_la_mode = h->param.analyse.i_gpu_la;
+            int b_prof = x264_gpu_la_prof_init();
+            double t_prep0 = b_prof ? x264_gpu_la_prof_now() : 0.0;
             gpu_la_prep_intra( h, fenc );
             if( do_search[0] )
             {
@@ -1054,6 +1117,9 @@ static int slicetype_frame_cost( x264_t *h, x264_mb_analysis_t *a,
                 else
                     gpu_la_prep_table( h, fenc, frames[p1], 1, p1-b-1, x264_weight_none );
             }
+            if( b_prof )
+                x264_gpu_la_prof_record( t_prep0, x264_gpu_la_prof_now(),
+                                         &x264_gpu_la_prof_prep, &x264_gpu_la_prof_preps );
         }
 #endif
 
@@ -1086,6 +1152,8 @@ static int slicetype_frame_cost( x264_t *h, x264_mb_analysis_t *a,
         else
 #endif
         {
+            int b_prof = x264_gpu_la_prof_init();
+            double t_pass0 = b_prof ? x264_gpu_la_prof_now() : 0.0;
             if( h->param.i_lookahead_threads > 1 )
             {
                 x264_slicetype_slice_t s[X264_LOOKAHEAD_THREAD_MAX];
@@ -1130,6 +1198,9 @@ static int slicetype_frame_cost( x264_t *h, x264_mb_analysis_t *a,
                     output_inter[0], output_intra[0] };
                 slicetype_slice_cost( &s );
             }
+            if( b_prof )
+                x264_gpu_la_prof_record( t_pass0, x264_gpu_la_prof_now(),
+                                         &x264_gpu_la_prof_pass, &x264_gpu_la_prof_passes );
 
             /* Sum up accumulators */
             if( b == p1 )
